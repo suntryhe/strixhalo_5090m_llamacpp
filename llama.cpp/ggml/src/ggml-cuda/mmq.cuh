@@ -2,6 +2,29 @@
 
 #include "common.cuh"
 
+#if defined(MMQ_NO_VEC_DOT)
+#define MMQ_DOT(x, y, s, k) ((void)0)
+#else
+#define MMQ_DOT(x, y, s, k) vec_dot(x, y, s, k)
+#endif
+
+// MMQ_TILEY_DOUBLE: tile_y 双缓冲流水线 (第四代)。
+// 原结构: tile_y[0]load → barrier → vec_dot(0) → barrier → tile_y[1]load → barrier → vec_dot(1) → barrier
+//   问题: 每次 tile_y 都是同步 global load, vec_dot 期间 LSU 空闲。
+// 新结构: tile_y0/tile_y1 独立 LDS 区, 两批 load 提前并行发, vec_dot(0)(1) 连续执行, barrier 4→2。
+//   代价: LDS +9KB/block (IQ3_S J=64: 26.8KB→35.8KB, occ 2→1)。收益>occ损失才保留。
+#if defined(MMQ_TILEY_DOUBLE)
+#define MMQ_TILEY_DOUBLE_BUFS 2
+#else
+#define MMQ_TILEY_DOUBLE_BUFS 1
+#endif
+
+#if defined(MMQ_NO_DEQUANT)
+#define MMQ_DEQUANT(...) ((void)0)
+#else
+#define MMQ_DEQUANT(...) ggml_cuda_mmq_load_tiles_iq3_s_dequant<type, J, fallback>(__VA_ARGS__)
+#endif
+
 #include <climits>
 #include <cstdint>
 
@@ -888,7 +911,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     extern __shared__ int data_mul_mat_q[];
     int * tile_y = data_mul_mat_q + J;
-    int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
+    int * tile_x = tile_y + MMQ_TILEY_DOUBLE_BUFS*GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
     // FP4 tile stores 8 blocks
@@ -904,6 +927,174 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
+#if defined(MMQ_REG_PIPELINE) && defined(GGML_USE_HIP)
+    // 跨迭代寄存器软件流水线：
+    //   迭代 N 开头 dequant(regs→tile_x) 等 load(N) 完成 [load(N) 在上迭代发出, 已飞行一整迭代 → 不阻塞]
+    //   随后 issue(N+1→regs) 发 load, 飞行窗口 = 本迭代 vec_dot 全程
+    //   tile_x 单 LDS 缓冲, barrier 结构不变 (4/迭代), 不占 LDS → occ2 保持
+    if constexpr (type == GGML_TYPE_IQ3_S || type == GGML_TYPE_MXFP4) {
+        if constexpr (type == GGML_TYPE_IQ3_S) {
+            constexpr int threads_per_row = (MMQ_ITER_K / (4 * QR3_S)) / 2;
+            constexpr int pf_nrows = warp_size / threads_per_row;
+            constexpr int rows_per_thread = I / (nwarps * pf_nrows);
+            int   i_arr[rows_per_thread];
+            int2  qs_arr[rows_per_thread];
+            int   qh_arr[rows_per_thread];
+            int   sg_arr[rows_per_thread];
+            int   sc_arr[rows_per_thread];
+            float d_arr[rows_per_thread];
+
+            if (kb0_start < kb0_stop) {
+                ggml_cuda_mmq_load_tiles_iq3_s_issue<type, J, fallback>(
+                    x, offset_x + kb0_start, tile_x_max_i, stride_row_x,
+                    i_arr, qs_arr, qh_arr, sg_arr, sc_arr, d_arr);
+            }
+
+#if defined(MMQ_TILEY_DOUBLE)
+            // 第四代流水线: tile_y 双缓冲。
+            //   tile_y0/tile_y1 独立 LDS 区, 两次 tile_y load 并行发出(互不依赖),
+            //   vec_dot(0) vec_dot(1) 背靠背执行, 中间无 barrier → 4 barrier/迭代 减到 2。
+            // 前提(已验证): vec_dot(0)(1) 读 tile_y 偏移相同(k0%32, (k0/QI8_1)%1 不依赖 k00),
+            //   只是内容不同 → 双缓冲后两条 load 流可同时飞行, vec_dot 期间 LSU 不再空闲。
+            int * tile_y0 = tile_y;
+            int * tile_y1 = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
+
+            for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+                MMQ_DEQUANT(
+                    tile_x, i_arr, qs_arr, qh_arr, sg_arr, sc_arr, d_arr);
+
+                if (kb0 + blocks_per_iter < kb0_stop) {
+                    ggml_cuda_mmq_load_tiles_iq3_s_issue<type, J, fallback>(
+                        x, offset_x + kb0 + blocks_per_iter, tile_x_max_i, stride_row_x,
+                        i_arr, qs_arr, qh_arr, sg_arr, sc_arr, d_arr);
+                }
+
+                // 交错双缓冲 load: y0/y1 同一循环内交替发 global load,
+                // 两路 load 流并行飞行 (编译器不再按程序顺序串行化两个独立循环)。
+                {
+                    const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+                    const int * by1 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+#pragma unroll
+                    for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                        const int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+
+                        tile_y0[l] = by0[l];
+                        tile_y1[l] = by1[l];
+                    }
+                }
+
+                __syncthreads();
+
+                MMQ_DOT(tile_x, tile_y0, sum, 0);
+                MMQ_DOT(tile_x, tile_y1, sum, MMQ_TILE_NE_K);
+
+                __syncthreads();
+            }
+#else
+            for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+                MMQ_DEQUANT(
+                    tile_x, i_arr, qs_arr, qh_arr, sg_arr, sc_arr, d_arr);
+
+                if (kb0 + blocks_per_iter < kb0_stop) {
+                    ggml_cuda_mmq_load_tiles_iq3_s_issue<type, J, fallback>(
+                        x, offset_x + kb0 + blocks_per_iter, tile_x_max_i, stride_row_x,
+                        i_arr, qs_arr, qh_arr, sg_arr, sc_arr, d_arr);
+                }
+                {
+                    const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+#pragma unroll
+                    for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                        int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+
+                        tile_y[l] = by0[l];
+                    }
+                }
+
+                __syncthreads();
+
+                MMQ_DOT(tile_x, tile_y, sum, 0);
+
+                __syncthreads();
+
+                {
+                    const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+#pragma unroll
+                    for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                        int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+
+                        tile_y[l] = by0[l];
+                    }
+                }
+
+                __syncthreads();
+
+                MMQ_DOT(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+
+                __syncthreads();
+            }
+#endif
+        } else { // MXFP4
+            constexpr int threads_per_row = MMQ_ITER_K / (4 * QR_MXFP4);
+            constexpr int pf_nrows = warp_size / threads_per_row;
+            constexpr int rows_per_thread  = I / (nwarps * pf_nrows);
+            constexpr int blocks_per_tile_x_row = MMQ_TILE_NE_K / QI_MXFP4;
+            constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+            constexpr int rows_per_thread_s = I / (nwarps * rows_per_warp);
+            int      i_arr[rows_per_thread];
+            int      qs_arr[rows_per_thread];
+            int      i_s_arr[rows_per_thread_s];
+            uint8_t  e_arr[rows_per_thread_s];
+
+            if (kb0_start < kb0_stop) {
+                ggml_cuda_mmq_load_tiles_mxfp4_issue<type, J, fallback>(
+                    x, offset_x + kb0_start, tile_x_max_i, stride_row_x,
+                    i_arr, qs_arr, i_s_arr, e_arr);
+            }
+
+            for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+                ggml_cuda_mmq_load_tiles_mxfp4_dequant<type, J, fallback>(
+                    tile_x, i_arr, qs_arr, i_s_arr, e_arr);
+
+                if (kb0 + blocks_per_iter < kb0_stop) {
+                    ggml_cuda_mmq_load_tiles_mxfp4_issue<type, J, fallback>(
+                        x, offset_x + kb0 + blocks_per_iter, tile_x_max_i, stride_row_x,
+                        i_arr, qs_arr, i_s_arr, e_arr);
+                }
+                {
+                    const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+#pragma unroll
+                    for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                        int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+
+                        tile_y[l] = by0[l];
+                    }
+                }
+
+                __syncthreads();
+
+                MMQ_DOT(tile_x, tile_y, sum, 0);
+
+                __syncthreads();
+
+                {
+                    const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+#pragma unroll
+                    for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                        int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+
+                        tile_y[l] = by0[l];
+                    }
+                }
+
+                __syncthreads();
+
+                MMQ_DOT(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+
+                __syncthreads();
+            }
+        }
+    } else
+#endif // defined(MMQ_REG_PIPELINE) && defined(GGML_USE_HIP)
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         {
@@ -918,7 +1109,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         __syncthreads();
 
-        vec_dot(tile_x, tile_y, sum, 0);
+        MMQ_DOT(tile_x, tile_y, sum, 0);
 
         __syncthreads();
 
@@ -934,7 +1125,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         __syncthreads();
 
-        vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+        MMQ_DOT(tile_x, tile_y, sum, MMQ_TILE_NE_K);
 
         __syncthreads();
     }
@@ -1386,7 +1577,12 @@ struct mmq_args {
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
     const size_t nbs_ids = config.J*sizeof(int);
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
-    const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
+    size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
+#if defined(MMQ_TILEY_DOUBLE)
+    if (config.type == GGML_TYPE_IQ3_S || config.type == GGML_TYPE_MXFP4) {
+        nbs_y *= MMQ_TILEY_DOUBLE_BUFS;
+    }
+#endif
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
@@ -1478,10 +1674,23 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     const int    cc    = ggml_cuda_info().devices[id].cc;
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
 
+    // Optional runtime cap on the J selected for the occupancy-2 pass (for tuning).
+    // J=64 measured best on gfx1151 (~446 t/s vs J=96 ~441, J=80 ~440, J=48 ~397).
+    // Set GGML_MMQ_MAX_J_OCC2 to override (e.g. 96/80) without recompiling.
+    int max_j_occ2 = 64;
+    const char * env_max_j = getenv("GGML_MMQ_MAX_J_OCC2");
+    if (env_max_j != nullptr) {
+        max_j_occ2 = atoi(env_max_j);
+    }
+
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
-    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+    // Prefer a config that actually achieves occupancy >= 2 (2 blocks/SM co-resident).
+    // On RDNA3_5 (gfx1151) with 64KB smpbo, J=128 (36KB) only reaches occ1 while J=96 (31.4KB)
+    // reaches occ2. Doubling co-resident blocks doubles in-flight DRAM requests, directly
+    // attacking the latency-bound MMQ bottleneck without sacrificing WMMA efficiency (I kept at 64).
+    for (int J = 8; J <= max_j_occ2 && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
         if (config.type == GGML_TYPE_COUNT) {
             continue;
@@ -1491,11 +1700,38 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             continue;
         }
 
+        const int occ_achieved = smpbo / (int) mmq_get_nbytes_shared(config, cc);
+        if (occ_achieved < 2) {
+            continue;
+        }
+
         const int ntiles_x = (args.ncols_max + config.J - 1) / config.J;
 
         if (ntiles_x < ntiles_J_best) {
             J_best = J;
             ntiles_J_best = ntiles_x;
+        }
+    }
+
+    // Fallback: if no occupancy-2 config is available (e.g. other GPUs with small smpbo),
+    // keep the original largest-J behaviour.
+    if (J_best == 0) {
+        for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
+            if (config.type == GGML_TYPE_COUNT) {
+                continue;
+            }
+
+            if (mmq_get_nbytes_shared(config, cc) > smpbo) {
+                continue;
+            }
+
+            const int ntiles_x = (args.ncols_max + config.J - 1) / config.J;
+
+            if (ntiles_x < ntiles_J_best) {
+                J_best = J;
+                ntiles_J_best = ntiles_x;
+            }
         }
     }
 

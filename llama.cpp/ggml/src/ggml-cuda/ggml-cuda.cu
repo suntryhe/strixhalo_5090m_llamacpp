@@ -136,16 +136,34 @@ int ggml_cuda_get_device() {
     return id;
 }
 
+// Unified (zero-copy) memory is only meaningful on UMA/APU parts such as the AMD "Strix Halo"
+// layout (AI MAX+), where the GPU shares system memory directly. A discrete NVIDIA card (CUDA0)
+// does not benefit and would fall back to an explicit copy, so the two builds are gated by their
+// own env var: HIP enables GGML_HIP_ENABLE_UNIFIED_MEMORY, CUDA enables GGML_CUDA_ENABLE_UNIFIED_MEMORY.
+// Since GGML_BACKEND_DL builds each backend from the same source into its own shared library, this
+// lets zero-copy be enabled for the ROCm/395 device while CUDA0 keeps the regular copy path.
+static bool ggml_cuda_unified_memory_enabled() {
+#if defined(GGML_USE_HIP)
+    return getenv("GGML_HIP_ENABLE_UNIFIED_MEMORY") != nullptr;
+#else
+    return getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr;
+#endif
+}
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
-    if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
+    if (ggml_cuda_unified_memory_enabled()) {
         err = cudaMallocManaged(ptr, size);
 #if defined(GGML_USE_HIP)
         if (err == hipSuccess) {
             // hipMemAdviseSetCoarseGrain is an optional performance hint;
             // ignore errors (e.g. hipErrorInvalidValue on some APU/iGPU configs).
+            // TEST 5: combine CoarseGrain + PreferredLocation + AccessedBy
+            // decode needs CoarseGrain (27 vs 19), prefill needs PreferredLocation (438 vs 420)
             (void)cudaMemAdvise(*ptr, size, hipMemAdviseSetCoarseGrain, device);
+            (void)cudaMemAdvise(*ptr, size, hipMemAdviseSetPreferredLocation, device);
+            (void)cudaMemAdvise(*ptr, size, hipMemAdviseSetAccessedBy, device);
             (void)hipGetLastError(); // clear any error
         }
 
@@ -4789,7 +4807,7 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
     CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
 
     // Check if UMA is explicitly enabled via environment variable
-    bool uma_env = getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr;
+    bool uma_env = ggml_cuda_unified_memory_enabled();
     bool is_uma = prop.integrated > 0 || uma_env;
 
     if (is_uma) {

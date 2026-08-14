@@ -1255,8 +1255,16 @@ struct ggml_cuda_graph {
     std::vector<node_properties> node_props;
 
     bool is_enabled() const {
+#if defined(GGML_USE_HIP)
+        // HIP/ROCm backend: independent control so CUDA graphs stay enabled on NVIDIA.
+        // ROCm wants graphs disabled for prefill (existing test: +~10% prefill), but the
+        // same disable knob must not turn off CUDA graph capture on the discrete NVIDIA card.
+        static const bool disable_rocm_graphs_due_to_env = (getenv("GGML_HIP_DISABLE_GRAPHS") != nullptr);
+        return !(disable_due_to_gpu_arch || disable_rocm_graphs_due_to_env);
+#else
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
         return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
+#endif
     }
 #endif
 };

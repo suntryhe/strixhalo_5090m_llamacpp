@@ -1368,52 +1368,118 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int nrows = warp_size / threads_per_row;
     const int kqsx = threadIdx.x % threads_per_row;
 
+    if constexpr (fallback) {
+        // Fallback (J=112) keeps the original single-loop loader; two-stage only on J=128.
 #pragma unroll
-    for (int i0 = 0; i0 < I; i0 += nwarps * nrows) {
-        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+        for (int i0 = 0; i0 < I; i0 += nwarps * nrows) {
+            int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
 
-        if (fallback) {
             i = min(i, i_max);
-        }
 
-        const block_iq3_s * bxi = (const block_iq3_s *) x + kbx0 + i*stride;
+            const block_iq3_s * bxi = (const block_iq3_s *) x + kbx0 + i*stride;
 
-        const int2      qs_packed = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
-        const uint8_t * qs        = (const uint8_t *) &qs_packed;
+            const int2      qs_packed = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
+            const uint8_t * qs        = (const uint8_t *) &qs_packed;
 
-        const int qh = bxi->qh[kqsx];
+            const int qh = bxi->qh[kqsx];
 
-        const int       signs_packed_32 = get_int_b2(bxi->signs, kqsx);
-        const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
+            const int       signs_packed_32 = get_int_b2(bxi->signs, kqsx);
+            const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
 
 #pragma unroll
-        for (int l = 0; l < QR3_S; ++l) {
-            const int2 grid_pos = make_int2(
-                iq3s_grid[qs[2*l+0] | ((qh << (8 - 2*l)) & 0x100)],
-                iq3s_grid[qs[2*l+1] | ((qh << (7 - 2*l)) & 0x100)]);
+            for (int l = 0; l < QR3_S; ++l) {
+                const int2 grid_pos = make_int2(
+                    iq3s_grid[qs[2*l+0] | ((qh << (8 - 2*l)) & 0x100)],
+                    iq3s_grid[qs[2*l+1] | ((qh << (7 - 2*l)) & 0x100)]);
 
-            const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
-            const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
+                const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
+                const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
 
-            const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
-            const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+                const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+                const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-            x_qs[i*sram_stride + 8*kqsx + (2*l+0)] = grid_l;
-            x_qs[i*sram_stride + 8*kqsx + (2*l+1)] = grid_h;
+                x_qs[i*sram_stride + 8*kqsx + (2*l+0)] = grid_l;
+                x_qs[i*sram_stride + 8*kqsx + (2*l+1)] = grid_h;
 #else
-            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (2*l+0)] = grid_l;
-            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (2*l+1)] = grid_h;
+                x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (2*l+0)] = grid_l;
+                x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (2*l+1)] = grid_h;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            }
+
+            const int ls = 1 + 2*((bxi->scales[kqsx/2] >> (((2*kqsx) << 1) & 0x04)) & 0x0F);
+            const float d = bxi->d;
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_df[i*sram_stride             + kqsx] = ls*d;
+#else
+            x_df[i*(MMQ_TILE_NE_K/4) + i/4 + kqsx] = ls*d;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         }
+    } else {
+        // Two-stage loader: issue all global loads first, then dequant.
+        constexpr int rows_per_thread = I / (nwarps * nrows);
 
-        const int ls = 1 + 2*((bxi->scales[kqsx/2] >> (((2*kqsx) << 1) & 0x04)) & 0x0F);
-        const float d = bxi->d;
+        int   i_arr[rows_per_thread];
+        int2  qs_arr[rows_per_thread];
+        int   qh_arr[rows_per_thread];
+        int   sg_arr[rows_per_thread];
+        int   sc_arr[rows_per_thread];
+        float d_arr[rows_per_thread];
+
+        {
+#pragma unroll
+            for (int r = 0; r < rows_per_thread; ++r) {
+                int i = r*(nwarps*nrows) + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+                i_arr[r] = i;
+
+                const block_iq3_s * bxi = (const block_iq3_s *) x + kbx0 + i*stride;
+
+                qs_arr[r] = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
+                qh_arr[r] = bxi->qh[kqsx];
+                sg_arr[r] = get_int_b2(bxi->signs, kqsx);
+                sc_arr[r] = bxi->scales[kqsx/2];
+                d_arr[r]  = bxi->d;
+            }
+        }
+
+#pragma unroll
+        for (int r = 0; r < rows_per_thread; ++r) {
+            const int i = i_arr[r];
+
+            const uint8_t * qs        = (const uint8_t *) &qs_arr[r];
+            const int       qh        = qh_arr[r];
+            const uint8_t * signs_packed_8 = (const uint8_t *) &sg_arr[r];
+
+#pragma unroll
+            for (int l = 0; l < QR3_S; ++l) {
+                const int2 grid_pos = make_int2(
+                    iq3s_grid[qs[2*l+0] | ((qh << (8 - 2*l)) & 0x100)],
+                    iq3s_grid[qs[2*l+1] | ((qh << (7 - 2*l)) & 0x100)]);
+
+                const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
+                const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
+
+                const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+                const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_df[i*sram_stride             + kqsx] = ls*d;
+                x_qs[i*sram_stride + 8*kqsx + (2*l+0)] = grid_l;
+                x_qs[i*sram_stride + 8*kqsx + (2*l+1)] = grid_h;
 #else
-        x_df[i*(MMQ_TILE_NE_K/4) + i/4 + kqsx] = ls*d;
+                x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (2*l+0)] = grid_l;
+                x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (2*l+1)] = grid_h;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            }
+
+            const int ls = 1 + 2*((sc_arr[r] >> (((2*kqsx) << 1) & 0x04)) & 0x0F);
+            const float d = d_arr[r];
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_df[i*sram_stride             + kqsx] = ls*d;
+#else
+            x_df[i*(MMQ_TILE_NE_K/4) + i/4 + kqsx] = ls*d;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        }
     }
 }
 
@@ -1575,48 +1641,115 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int kbx  = txi / QI_MXFP4;
     const int kqsx = txi % QI_MXFP4;
 
+    if constexpr (fallback) {
+        // Fallback (J=112) keeps the original single-loop loader; two-stage only on J=128.
 #pragma unroll
-    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
-        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+        for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+            int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
 
-        if (fallback) {
             i = min(i, i_max);
-        }
 
-        const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbx;
+            const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbx;
 
-        const int aux_q4 = get_int_b1(bxi->qs, kqsx);
-        const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
-        const int k0 = kbx * (2 * QI_MXFP4) + kqsx;
+            const int aux_q4 = get_int_b1(bxi->qs, kqsx);
+            const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+            const int k0 = kbx * (2 * QI_MXFP4) + kqsx;
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_qs[i*sram_stride + k0 + 0]        = v.x;
-        x_qs[i*sram_stride + k0 + QI_MXFP4] = v.y;
+            x_qs[i*sram_stride + k0 + 0]        = v.x;
+            x_qs[i*sram_stride + k0 + QI_MXFP4] = v.y;
 #else
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + 0]        = v.x;
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + QI_MXFP4] = v.y;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + 0]        = v.x;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + QI_MXFP4] = v.y;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)  || defined(AMD_WMMA_AVAILABLE)
+        }
+    } else {
+        // Two-stage loader: issue all global loads first, then dequant.
+        constexpr int rows_per_thread = I / (nwarps * nrows);
+
+        int   i_arr[rows_per_thread];
+        int   qs_arr[rows_per_thread];
+
+        {
+#pragma unroll
+            for (int r = 0; r < rows_per_thread; ++r) {
+                int i = r*(nwarps*nrows) + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+                i_arr[r] = i;
+
+                const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbx;
+
+                qs_arr[r] = get_int_b1(bxi->qs, kqsx);
+            }
+        }
+
+#pragma unroll
+        for (int r = 0; r < rows_per_thread; ++r) {
+            const int i = i_arr[r];
+
+            const int2 v = get_int_from_table_16(qs_arr[r], kvalues_mxfp4);
+            const int k0 = kbx * (2 * QI_MXFP4) + kqsx;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_qs[i*sram_stride + k0 + 0]        = v.x;
+            x_qs[i*sram_stride + k0 + QI_MXFP4] = v.y;
+#else
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + 0]        = v.x;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + QI_MXFP4] = v.y;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)  || defined(AMD_WMMA_AVAILABLE)
+        }
     }
 
     constexpr int blocks_per_tile_x_row = MMQ_TILE_NE_K / QI_MXFP4;
     constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
     const int kbxd = threadIdx.x % blocks_per_tile_x_row;
 
+    if constexpr (fallback) {
+        // Fallback (J=112) keeps the original single-loop scales loader.
 #pragma unroll
-    for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
-        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+        for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
+            int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
 
-        if (fallback) {
             i = min(i, i_max);
-        }
 
-        const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbxd;
+            const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbxd;
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_df[i*sram_stride                           + kbxd] = ggml_cuda_e8m0_to_fp32(bxi->e)*0.5f;
+            x_df[i*sram_stride                           + kbxd] = ggml_cuda_e8m0_to_fp32(bxi->e)*0.5f;
 #else
-        x_df[i*(MMQ_TILE_NE_K/QI_MXFP4) + i/QI_MXFP4 + kbxd] = ggml_cuda_e8m0_to_fp32(bxi->e)*0.5f;
+            x_df[i*(MMQ_TILE_NE_K/QI_MXFP4) + i/QI_MXFP4 + kbxd] = ggml_cuda_e8m0_to_fp32(bxi->e)*0.5f;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        }
+    } else {
+        // Two-stage loader for scales: issue all global loads first, then convert.
+        constexpr int rows_per_thread_s = I / (nwarps * rows_per_warp);
+
+        int    i_s_arr[rows_per_thread_s];
+        uint8_t e_arr[rows_per_thread_s];
+
+        {
+#pragma unroll
+            for (int r = 0; r < rows_per_thread_s; ++r) {
+                int i = r*(nwarps*rows_per_warp) + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+
+                i_s_arr[r] = i;
+
+                const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbxd;
+
+                e_arr[r] = bxi->e;
+            }
+        }
+
+#pragma unroll
+        for (int r = 0; r < rows_per_thread_s; ++r) {
+            const int i = i_s_arr[r];
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_df[i*sram_stride                         + kbxd] = ggml_cuda_e8m0_to_fp32(e_arr[r])*0.5f;
+#else
+            x_df[i*(MMQ_TILE_NE_K/QI_MXFP4) + i/QI_MXFP4 + kbxd] = ggml_cuda_e8m0_to_fp32(e_arr[r])*0.5f;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        }
     }
 }
 
@@ -1758,3 +1891,213 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         x_u32_scale[i*sram_stride] = get_int_b4(bxi->d, 0);
     }
 }
+
+// ============================================================================
+// MMQ_REG_PIPELINE: 跨迭代寄存器软件流水线 (issue: 只发 load / dequant: 寄存器→LDS)
+// 迭代 N 初 issue 迭代 N+1 的权重 load (飞行窗口 = 整个迭代计算), 迭代 N 末 dequant 写 LDS。
+// 数据只读一次、真实消费 (无 dummy hack)、不占 LDS → occ2 保持。
+// ============================================================================
+#if defined(MMQ_REG_PIPELINE) && defined(GGML_USE_HIP)
+
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq3_s_issue(
+        const char * __restrict__ x, const int kbx0, const int i_max, const int stride,
+        int * __restrict__ i_arr, int2 * __restrict__ qs_arr, int * __restrict__ qh_arr,
+        int * __restrict__ sg_arr, int * __restrict__ sc_arr, float * __restrict__ d_arr) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int threads_per_row = (MMQ_ITER_K / (4 * QR3_S)) / 2;
+    constexpr int nrows = warp_size / threads_per_row;
+    constexpr int rows_per_thread = I / (nwarps * nrows);
+    const int kqsx = threadIdx.x % threads_per_row;
+
+    GGML_UNUSED_VARS(i_max);
+
+#pragma unroll
+    for (int r = 0; r < rows_per_thread; ++r) {
+        int i = r*(nwarps*nrows) + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        i_arr[r] = i;
+
+        const block_iq3_s * bxi = (const block_iq3_s *) x + kbx0 + i*stride;
+
+        qs_arr[r] = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
+        qh_arr[r] = bxi->qh[kqsx];
+        sg_arr[r] = get_int_b2(bxi->signs, kqsx);
+        sc_arr[r] = bxi->scales[kqsx/2];
+        d_arr[r]  = bxi->d;
+    }
+}
+
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq3_s_dequant(
+        int * __restrict__ x_tile,
+        const int * __restrict__ i_arr, const int2 * __restrict__ qs_arr,
+        const int * __restrict__ qh_arr, const int * __restrict__ sg_arr,
+        const int * __restrict__ sc_arr, const float * __restrict__ d_arr) {
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_IQ3_S, ggml_cuda_mmq_get_I(type, J, fallback));
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif
+
+    constexpr int rows_per_thread = ggml_cuda_mmq_get_I(type, J, fallback) /
+        ((ggml_cuda_mmq_get_nthreads(type, J, fallback) / ggml_cuda_get_physical_warp_size()) *
+         (ggml_cuda_get_physical_warp_size() / ((MMQ_ITER_K / (4 * QR3_S)) / 2)));
+    constexpr int threads_per_row = (MMQ_ITER_K / (4 * QR3_S)) / 2;
+    const int kqsx = threadIdx.x % threads_per_row;
+
+#pragma unroll
+    for (int r = 0; r < rows_per_thread; ++r) {
+        const int i = i_arr[r];
+
+        const uint8_t * qs        = (const uint8_t *) &qs_arr[r];
+        const int       qh        = qh_arr[r];
+        const uint8_t * signs_packed_8 = (const uint8_t *) &sg_arr[r];
+
+#pragma unroll
+        for (int l = 0; l < QR3_S; ++l) {
+            const int2 grid_pos = make_int2(
+                iq3s_grid[qs[2*l+0] | ((qh << (8 - 2*l)) & 0x100)],
+                iq3s_grid[qs[2*l+1] | ((qh << (7 - 2*l)) & 0x100)]);
+
+            const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
+            const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
+
+            const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+            const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_qs[i*sram_stride + 8*kqsx + (2*l+0)] = grid_l;
+            x_qs[i*sram_stride + 8*kqsx + (2*l+1)] = grid_h;
+#else
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (2*l+0)] = grid_l;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + (2*l+1)] = grid_h;
+#endif
+        }
+
+        const int ls = 1 + 2*((sc_arr[r] >> (((2*kqsx) << 1) & 0x04)) & 0x0F);
+        const float d = d_arr[r];
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*sram_stride             + kqsx] = ls*d;
+#else
+        x_df[i*(MMQ_TILE_NE_K/4) + i/4 + kqsx] = ls*d;
+#endif
+    }
+}
+
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_mxfp4_issue(
+        const char * __restrict__ x, const int kbx0, const int i_max, const int stride,
+        int * __restrict__ i_arr, int * __restrict__ qs_arr,
+        int * __restrict__ i_s_arr, uint8_t * __restrict__ e_arr) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+
+    constexpr int threads_per_row = MMQ_ITER_K / (4 * QR_MXFP4);
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kbx  = txi / QI_MXFP4;
+    const int kqsx = txi % QI_MXFP4;
+
+    constexpr int rows_per_thread = I / (nwarps * nrows);
+
+    GGML_UNUSED_VARS(i_max);
+
+#pragma unroll
+    for (int r = 0; r < rows_per_thread; ++r) {
+        int i = r*(nwarps*nrows) + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+        i_arr[r] = i;
+
+        const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbx;
+
+        qs_arr[r] = get_int_b1(bxi->qs, kqsx);
+    }
+
+    constexpr int blocks_per_tile_x_row = MMQ_TILE_NE_K / QI_MXFP4;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+
+    constexpr int rows_per_thread_s = I / (nwarps * rows_per_warp);
+
+#pragma unroll
+    for (int r = 0; r < rows_per_thread_s; ++r) {
+        int i = r*(nwarps*rows_per_warp) + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+
+        i_s_arr[r] = i;
+
+        const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbxd;
+
+        e_arr[r] = bxi->e;
+    }
+}
+
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_mxfp4_dequant(
+        int * __restrict__ x_tile,
+        const int * __restrict__ i_arr, const int * __restrict__ qs_arr,
+        const int * __restrict__ i_s_arr, const uint8_t * __restrict__ e_arr) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_MXFP4, I);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif
+
+    constexpr int threads_per_row = MMQ_ITER_K / (4 * QR_MXFP4);
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kbx  = txi / QI_MXFP4;
+    const int kqsx = txi % QI_MXFP4;
+
+    constexpr int rows_per_thread = I / (nwarps * nrows);
+
+#pragma unroll
+    for (int r = 0; r < rows_per_thread; ++r) {
+        const int i = i_arr[r];
+
+        const int2 v = get_int_from_table_16(qs_arr[r], kvalues_mxfp4);
+        const int k0 = kbx * (2 * QI_MXFP4) + kqsx;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_qs[i*sram_stride + k0 + 0]        = v.x;
+        x_qs[i*sram_stride + k0 + QI_MXFP4] = v.y;
+#else
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + 0]        = v.x;
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + QI_MXFP4] = v.y;
+#endif
+    }
+
+    constexpr int blocks_per_tile_x_row = MMQ_TILE_NE_K / QI_MXFP4;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+
+    constexpr int rows_per_thread_s = I / (nwarps * rows_per_warp);
+
+#pragma unroll
+    for (int r = 0; r < rows_per_thread_s; ++r) {
+        const int i = i_s_arr[r];
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*sram_stride                         + kbxd] = ggml_cuda_e8m0_to_fp32(e_arr[r])*0.5f;
+#else
+        x_df[i*(MMQ_TILE_NE_K/QI_MXFP4) + i/QI_MXFP4 + kbxd] = ggml_cuda_e8m0_to_fp32(e_arr[r])*0.5f;
+#endif
+    }
+}
+#endif // defined(MMQ_REG_PIPELINE) && defined(GGML_USE_HIP)
