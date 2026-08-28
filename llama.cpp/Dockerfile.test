@@ -1,5 +1,5 @@
 # llamacpp-latest 双后端测试镜像 (与生产 baseline 同形态: Fedora43 + ROCm 7.2.4 + CUDA 13.2)
-# 源码: llamacpp-latest = 最新 mainline a94d563 + 全部调优 (dspark + UMA + occ2 + 降块)
+# 源码: llamacpp-latest = mainline 90c26fc (qwen4exp 已入主线) + 全部调优 (UMA+occ2+降块+MEM开关)
 # 双后端: -DGGML_CUDA=ON -DGGML_HIP=ON (验证 -dev CUDA0,ROCm0)
 
 FROM registry.fedoraproject.org/fedora:43
@@ -102,9 +102,15 @@ RUN echo "🔨 编译 llamacpp-latest (dspark+调优) CUDA+ROCm 双后端..." \
   && rm -rf /src/build \
   && echo "✅ 双后端测试镜像编译完成"
 
+# 运行时开关 (与 qwen-next 生产镜像一致, 去掉死变量 GGML_DL_DEBUG/LLAMA_QWEN4EXP)
+# MEM_ADVISE/MEM_MODE 不设 = 默认 combo advise + managed, 即生产验证过的行为
 ENV GGML_CUDA=1 \
     GGML_HIP=1 \
-    GGML_BACKEND_DL=1
+    GGML_BACKEND_DL=1 \
+    GGML_HIP_ENABLE_UNIFIED_MEMORY=1 \
+    GGML_HIP_DISABLE_GRAPHS=1 \
+    GGML_MMQ_MAX_J_OCC2=64 \
+    HSA_OVERRIDE_GFX_VERSION=11.5.1
 
 WORKDIR /app
 CMD ["llama-server", "--host", "0.0.0.0", "--port", "8082", "--ctx-size", "4096", "--n-gpu-layers", "all"]
