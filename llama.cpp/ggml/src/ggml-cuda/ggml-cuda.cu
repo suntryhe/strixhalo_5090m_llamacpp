@@ -153,7 +153,16 @@ static bool ggml_cuda_unified_memory_enabled() {
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
-    if (ggml_cuda_unified_memory_enabled()) {
+    // 2026-08-12: GGML_HIP_MEM_MODE=pool forces GPU-pool (hipMalloc) instead of
+    // managed memory. Microbench (8MB, gfx1151): hipMalloc 0.013ms vs
+    // cudaMallocManaged 0.128ms = 9.8x faster. Managed fine-grained page path adds
+    // per-access coherence overhead even when the buffer fits in the same physical RAM.
+    // On an APU hipMalloc is the same physical DRAM, so this is still zero-copy -
+    // it just drops the managed coherence overhead. Only reached when
+    // GGML_HIP_ENABLE_UNIFIED_MEMORY is set (HIP/ROCm0 backend).
+    const char * mem_mode = getenv("GGML_HIP_MEM_MODE");
+    const bool force_pool = mem_mode != nullptr && strcmp(mem_mode, "pool") == 0;
+    if (ggml_cuda_unified_memory_enabled() && !force_pool) {
         err = cudaMallocManaged(ptr, size);
 #if defined(GGML_USE_HIP)
         if (err == hipSuccess) {
@@ -161,9 +170,20 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
             // ignore errors (e.g. hipErrorInvalidValue on some APU/iGPU configs).
             // TEST 5: combine CoarseGrain + PreferredLocation + AccessedBy
             // decode needs CoarseGrain (27 vs 19), prefill needs PreferredLocation (438 vs 420)
-            (void)cudaMemAdvise(*ptr, size, hipMemAdviseSetCoarseGrain, device);
-            (void)cudaMemAdvise(*ptr, size, hipMemAdviseSetPreferredLocation, device);
-            (void)cudaMemAdvise(*ptr, size, hipMemAdviseSetAccessedBy, device);
+            // 2026-08-12: mem-advise mode dictated by GGML_HIP_MEM_ADVISE env for A/B tuning.
+            //   default=""   -> combo (CoarseGrain+PreferredLocation+AccessedBy), historical best
+            //   "readmostly" -> ReadMostly only
+            //   "prefloc"    -> PreferredLocation+AccessedBy only
+            //   "coarse"     -> CoarseGrain only
+            //   "none"       -> no advise at all
+            const char * adv = getenv("GGML_HIP_MEM_ADVISE");
+            const bool do_coarse = adv == nullptr || strstr(adv, "coarse") != nullptr;
+            const bool do_prefloc = adv == nullptr || strstr(adv, "prefloc") != nullptr || strstr(adv, "combo") != nullptr;
+            const bool do_readmostly = adv != nullptr && strstr(adv, "readmostly") != nullptr;
+            if (do_coarse)     (void)cudaMemAdvise(*ptr, size, hipMemAdviseSetCoarseGrain, device);
+            if (do_prefloc)   { (void)cudaMemAdvise(*ptr, size, hipMemAdviseSetPreferredLocation, device);
+                                (void)cudaMemAdvise(*ptr, size, hipMemAdviseSetAccessedBy, device); }
+            if (do_readmostly) (void)cudaMemAdvise(*ptr, size, hipMemAdviseSetReadMostly, device);
             (void)hipGetLastError(); // clear any error
         }
 
