@@ -1098,9 +1098,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "MOE_FUSED",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1213,9 +1214,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "moe_fused(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1893,6 +1895,71 @@ void * ggml_new_buffer(struct ggml_context * ctx, size_t nbytes) {
 
 struct ggml_tensor * ggml_dup_tensor(struct ggml_context * ctx, const struct ggml_tensor * src) {
     return ggml_new_tensor(ctx, src->type, GGML_MAX_DIMS, src->ne);
+}
+
+struct ggml_tensor * ggml_ds4_deferred_peer_copy(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * src) {
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src));
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, src);
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = src;
+
+    // op_params[2..3] holds the native event handle, written by the scheduler
+    // after backend assignment and before graph allocation.
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_DEFERRED_PEER_COPY);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_fused(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * input,
+        struct ggml_tensor  * gate_w,
+        struct ggml_tensor  * up_w,
+        struct ggml_tensor  * down_w,
+        struct ggml_tensor  * expert_ids,
+        struct ggml_tensor  * expert_wts,
+        struct ggml_tensor  * sh_gate_w,
+        struct ggml_tensor  * sh_up_w,
+        struct ggml_tensor  * sh_down_w,
+        struct ggml_tensor  * sh_gate_inp_w,
+        int64_t               n_embd,
+        int64_t               ff_dim,
+        int64_t               n_expert_used) {
+    GGML_ASSERT(ggml_is_contiguous(input));
+    GGML_ASSERT(input->type == GGML_TYPE_F32);
+    GGML_ASSERT(input->ne[0] == n_embd);
+    GGML_ASSERT(input->ne[1] == 1); // decode only, the kernel handles one token
+    GGML_ASSERT(gate_w->ne[0] == n_embd);
+    GGML_ASSERT(gate_w->ne[1] == ff_dim);
+    GGML_ASSERT(up_w->ne[0] == n_embd);
+    GGML_ASSERT(up_w->ne[1] == ff_dim);
+    GGML_ASSERT(down_w->ne[0] == ff_dim);
+    GGML_ASSERT(down_w->ne[1] == n_embd);
+    GGML_ASSERT(expert_ids->ne[0] == n_expert_used);
+    GGML_ASSERT(ggml_nelements(expert_wts) == n_expert_used);
+
+    const int64_t ne[2] = { n_embd, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 2, ne);
+
+    result->op     = GGML_OP_MOE_FUSED;
+    result->src[0] = input;
+    result->src[1] = gate_w;
+    result->src[2] = up_w;
+    result->src[3] = down_w;
+    result->src[4] = expert_ids;
+    result->src[5] = expert_wts;
+    result->src[6] = sh_gate_w;
+    result->src[7] = sh_up_w;
+    result->src[8] = sh_down_w;
+    result->src[9] = sh_gate_inp_w;
+
+    ggml_set_op_params_i32(result, 0, (int32_t) n_embd);
+
+    return result;
 }
 
 void ggml_unravel_index(const struct ggml_tensor * tensor, int64_t i, int64_t * i0, int64_t * i1, int64_t * i2, int64_t * i3) {
@@ -2596,6 +2663,13 @@ struct ggml_tensor * ggml_repeat_4d(
 
     result->op     = GGML_OP_REPEAT;
     result->src[0] = a;
+
+    // diagnostic (MOE_DEBUG_REPEAT): trace every repeat so a runtime src
+    // mismatch can be matched back to its builder site via the result pointer
+    if (getenv("MOE_DEBUG_REPEAT") != NULL) {
+        fprintf(stderr, "REPEAT-BUILD result=%p a=[%s %lld,%lld,%lld,%lld] -> [%lld,%lld,%lld,%lld]\n",
+                (void *) result, a->name, a->ne[0], a->ne[1], a->ne[2], a->ne[3], ne0, ne1, ne2, ne3);
+    }
 
     return result;
 }

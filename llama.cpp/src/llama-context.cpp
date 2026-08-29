@@ -1,10 +1,13 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "../ggml/src/ggml-impl.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-hotstats.h"
+#include "llama-expert-lru.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -17,8 +20,10 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 //
 // llama_context
@@ -90,6 +95,8 @@ llama_context::llama_context(
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+
+    llama_hotstats::init();
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -279,6 +286,13 @@ llama_context::llama_context(
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
 
+        // GGML_MOE_TRIPLE submits many small per-layer cgraphs whose topology
+        // changes every step; reusing the previous graph objects would re-split
+        // them (split_graph permanently rewrites node src) -> dangling pointers.
+        if (getenv("GGML_MOE_TRIPLE") != nullptr) {
+            graph_reuse_disable = true;
+        }
+
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
@@ -425,12 +439,20 @@ llama_context::llama_context(
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // experiment: LLAMA_PP_FORCE=1 bypasses the has_tensor_overrides() gate
+        // (with -ot we still want pipeline parallelism to see if the new
+        //  no-peer-copy build with events=true actually helps hot/cold overlap)
+        const bool pp_force = getenv("LLAMA_PP_FORCE") != nullptr;
         bool pipeline_parallel =
             model.n_devices() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
-            !model.has_tensor_overrides();
+            (pp_force || !model.has_tensor_overrides());
+
+        fprintf(stderr, "PPDBG n_dev=%zu gpu_layers=%d layer_all=%d split=%d offload_kqv=%d overrides=%d pp_force=%d\n",
+                (size_t) model.n_devices(), model.n_gpu_layers(), model.hparams.n_layer_all,
+                (int) model.split_mode(), (int) cparams.offload_kqv, (int) model.has_tensor_overrides(), (int) pp_force);
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -444,6 +466,8 @@ llama_context::llama_context(
                 auto * dev = ggml_backend_get_device(backend.get());
                 ggml_backend_dev_props props;
                 ggml_backend_dev_get_props(dev, &props);
+                fprintf(stderr, "CCAP dev=%s async=%d events=%d type=%d\n",
+                        ggml_backend_dev_name(dev), (int) props.caps.async, (int) props.caps.events, (int) dev_type);
                 if (!props.caps.async || !props.caps.events) {
                     // device does not support async compute or events
                     pipeline_parallel = false;
@@ -481,6 +505,8 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    llama_hotstats::fini();
 
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -601,7 +627,93 @@ void llama_context::sched_reserve() {
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    // the per-layer graph storage (GGML_MOE_TRIPLE) needs the layer count before
+    // build_graph runs; reset() only knows max_nodes
+    const int64_t n_layers = model.hparams.n_layer();
+    gf_res_prev->set_n_layer(n_layers);
+    gf_res_reserve->set_n_layer(n_layers);
+
+    // GGML_SCHED_EVENTS=1: parallel=true -> copy events replace full-stream host syncs at split boundaries
+    const bool main_sched_parallel = cparams.pipeline_parallel || getenv("GGML_SCHED_EVENTS") != nullptr;
+    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, main_sched_parallel, cparams.op_offload));
+
+    // second scheduler for the cold MoE chain graph: only the non-hot GPU
+    // backends (ROCm0) + CPU. the hot devices (CUDA0) must be excluded: with
+    // both scheds submitting flash-attn kernels to the same CUDA stream the run
+    // crashes with "illegal memory access". cold-chain layers whose expert
+    // weights are kept on CUDA0 (blk.0-2/42 under the -ot range) stay in the
+    // main graph (see gf_moe routing in build_moe_ffn). single-graph mode is the
+    // default (ggml's own cross-backend machinery yields correct + parallel
+    // execution); set GGML_MOE_DUAL=1 to add the second sched (research only).
+    // GGML_MOE_TRIPLE also needs sched_cold for the per-layer cold subgraphs.
+    const bool moe_dual = getenv("GGML_MOE_DUAL") != nullptr || getenv("GGML_MOE_TRIPLE") != nullptr;
+    // luz policy: the deferred peer-copy join requires both GPU chain backends
+    // to share a runtime (same vendor); cross-vendor falls back to host staging.
+    // compare device-name prefixes, not reg GUIDs: the HIP backend is compiled
+    // from the same ggml-cuda sources, so both report the same backend GUID
+    {
+        const char * first_gpu_vendor = nullptr;
+        bool same_vendor_gpu = true;
+        for (auto & backend : backends) {
+            ggml_backend_t b = backend.get();
+            ggml_backend_dev_t dev = ggml_backend_get_device(b);
+            if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                continue;
+            }
+            const char * dev_name = ggml_backend_dev_name(dev);
+            if (dev_name == nullptr) {
+                continue;
+            }
+            if (first_gpu_vendor == nullptr) {
+                first_gpu_vendor = dev_name;
+                continue;
+            }
+            if (strncmp(first_gpu_vendor, dev_name, 4) != 0) {
+                same_vendor_gpu = false;
+                break;
+            }
+        }
+        llama_set_moe_deferred_join_supported(same_vendor_gpu);
+        if (getenv("GGML_MOE_TRIPLE_DEFERRED_JOIN") != nullptr && !same_vendor_gpu) {
+            fprintf(stderr, "%s: direct peer join disabled across GPU vendors; using scheduler host staging\n", __func__);
+        }
+    }
+    {
+        std::vector<ggml_backend_t>      cold_ptrs;
+        std::vector<ggml_backend_buffer_type_t> cold_bufts;
+        for (auto & backend : backends) {
+            ggml_backend_t b = backend.get();
+            ggml_backend_dev_t dev = ggml_backend_get_device(b);
+            if (dev == nullptr) {
+                continue;
+            }
+            const char * dev_name = ggml_backend_dev_name(dev);
+            const bool is_cuda = dev_name != nullptr && strncmp(dev_name, "CUDA", 4) == 0;
+            if (!is_cuda) {
+                cold_ptrs.push_back(b);
+                cold_bufts.push_back(ggml_backend_get_default_buffer_type(b));
+            }
+        }
+        if (!cold_ptrs.empty() && moe_dual) {
+            // ROCm0-only sched has no intra-sched cross-device splits, so pipeline
+            // copies/events add nothing; keep them off to avoid a copy of every
+            // backend's compute buffer (CUDA0 OOMs with the main sched's buffer).
+            sched_cold.reset(ggml_backend_sched_new(cold_ptrs.data(), cold_bufts.data(), cold_ptrs.size(), max_nodes, false, cparams.op_offload));
+            fprintf(stderr, "MOESCHED cold sched initialized with %zu backend(s)\n", cold_ptrs.size());
+        }
+    }
+
+    // per-layer graph scheduler (GGML_MOE_TRIPLE): A_il/hot_il/cold_il run here.
+    // keep it on all backends (CUDA0, ROCm0, CPU) so a layer's hot+cold chains
+    // can split across them; the per-layer graphs never touch the main sched,
+    // so the whole-model tail (main sched) and cold chain (sched_cold) keep the
+    // allocation they got in process_ubatch and are never split a second time.
+    if (getenv("GGML_MOE_TRIPLE") != nullptr) {
+        // GGML_SCHED_EVENTS=1: parallel=true -> copy events replace full-stream host syncs at split boundaries
+        const bool sched_parallel = getenv("GGML_SCHED_EVENTS") != nullptr;
+        sched_layer.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, sched_parallel, cparams.op_offload));
+        fprintf(stderr, "MOESCHED layer sched initialized with %zu backend(s) parallel=%d\n", backend_ptrs.size(), (int) sched_parallel);
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -716,6 +828,10 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+
+    if (sched_cold) {
+        ggml_backend_sched_synchronize(sched_cold.get());
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1359,6 +1475,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
+        if (sched_cold) {
+            // the cold sched keeps is_alloc=true after its first alloc_graph;
+            // reset it alongside the main sched on graph rebuild so a second
+            // process_ubatch (actual decode) can allocate again (GGML_ASSERT
+            // !sched->is_alloc in ggml_backend_sched_alloc_graph)
+            ggml_backend_sched_reset(sched_cold.get());
+        }
+        if (sched_layer) {
+            ggml_backend_sched_reset(sched_layer.get());
+        }
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
@@ -1373,6 +1499,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // allocate the cold MoE chain graph FIRST on the second scheduler
+        // (ROCm0): shared tensors (the cold aggregate moe_out, host boundaries)
+        // get a ROCm0/CPU buffer here, so the main sched [CUDA0, ROCm0, CPU]
+        // later sees them as pre-allocated and binds them to ROCm0 instead of
+        // CUDA0. alloc the other way around and the cold sched aborts on a
+        // CUDA0-buffered moe_out (GGML_ABORT pre-allocated tensor ... CUDA0)
+        if (sched_cold) {
+            ggml_cgraph * gf_cold = res->get_gf_cold();
+            if (gf_cold != nullptr && gf_cold->n_nodes > 0) {
+                if (!ggml_backend_sched_alloc_graph(sched_cold.get(), gf_cold)) {
+                    LLAMA_LOG_ERROR("%s: failed to allocate cold graph\n", __func__);
+                    ret = GGML_STATUS_ALLOC_FAILED;
+                    return nullptr;
+                }
+            }
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -1385,16 +1528,210 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        // when GGML_MOE_TRIPLE splits every layer into per-layer graphs, the whole-model
+        // tail (main sched) is tiny and no longer contains the attention inputs
+        // (k_idxs/kq_mask/k_rot...). they are only allocated once the per-layer
+        // graphs run on the layer sched, so set_inputs would skip filling them and
+        // the SET_ROWS kernels would read uninitialized row indices. pre-alloc the
+        // first per-layer graph on the layer sched so those inputs get buffers here.
+        static const bool moe_triple_alloc = getenv("GGML_MOE_TRIPLE") != nullptr;
+        if (moe_triple_alloc && sched_layer && res->get_gf_a(0) != nullptr) {
+            ggml_backend_sched_reset(sched_layer.get());
+            if (!ggml_backend_sched_alloc_graph(sched_layer.get(), res->get_gf_a(0))) {
+                ret = GGML_STATUS_ALLOC_FAILED;
+            } else {
+                moe_prealloc_a0 = true;
+            }
+        }
+
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, &ubatch);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // hot expert statistics: read the per-layer selected_experts snapshots
+    // registered during graph build (see llm_graph_result::add_moe_snap)
+    if (llama_hotstats::enabled()) {
+        const auto & snaps = res->get_moe_snaps();
+        for (const auto & s : snaps) {
+            const ggml_tensor * ids = s.snap;
+            if (ids == nullptr || ids->type != GGML_TYPE_I32) {
+                continue;
+            }
+            const int n_used  = ids->ne[0];
+            const int n_tok   = ids->ne[1];
+            const int64_t nelem = (int64_t) n_used * n_tok;
+            if (nelem <= 0) {
+                continue;
+            }
+            std::vector<int32_t> buf(nelem);
+            ggml_backend_tensor_get(ids, buf.data(), 0, nelem * sizeof(int32_t));
+            llama_hotstats::record(s.il, buf.data(), n_used, n_tok);
+        }
+        llama_hotstats::maybe_dump();
+    }
+
+    // LRU expert cache ring: during decode we only accumulate which cold
+    // experts were selected (host-side set insert, no GPU work). Every
+    // LLAMA_EXPERT_LRU_APPLY_EVERY decodes (default 8) the pending set is
+    // applied in one batch: cold weight columns copied into spare hot slots
+    // and remap/flag/cold_remap updated, so the next decodes route those
+    // experts through the hot (CUDA) branch. Batching keeps the copies off
+    // the per-token critical path.
+    // Prefill (n_tokens > 1) never swaps: it only harvests routing statistics
+    // (candidate_count) so the first decodes start with prefill-informed hot
+    // candidates. Swap-in happens only during decode, one thread at a time.
+    if (llm_expert_lru::enabled()) {
+        static bool lru_dbg_once = true;
+        static std::mutex lru_mutex;
+        static std::vector<llm_expert_lru::LayerState> lru_states;
+        static std::vector<std::vector<int32_t>> pending; // per-layer accumulated selected ids
+        static int decode_count = 0;
+        static int window_tokens = 0;
+        const int32_t K = getenv("LLAMA_EXPERT_LRU_SLOTS_PER_LAYER") ? std::max(0, std::atoi(getenv("LLAMA_EXPERT_LRU_SLOTS_PER_LAYER"))) : 0;
+        const int apply_every = std::max(1, getenv("LLAMA_EXPERT_LRU_APPLY_EVERY") ? std::atoi(getenv("LLAMA_EXPERT_LRU_APPLY_EVERY")) : 8);
+        const bool is_prefill = ubatch.n_tokens > 1;
+        // prefill is the dense pass: skip its routing-stat harvest entirely
+        // when LLAMA_EXPERT_LRU_PREFILL_STATS=0 (user benchmark switch)
+        const bool prefill_stats = getenv("LLAMA_EXPERT_LRU_PREFILL_STATS") ? std::atoi(getenv("LLAMA_EXPERT_LRU_PREFILL_STATS")) > 0 : true;
+
+        // concurrent decodes must not race on pending/lru_states; if the lock
+        // is busy we skip this batch entirely (next decode picks it up)
+        std::unique_lock<std::mutex> lru_lock(lru_mutex, std::try_to_lock);
+        if (!lru_lock.owns_lock()) {
+            return res;
+        }
+
+        // one decode tick per generated token: advance every layer's clock so
+        // grace/idle bookkeeping in the LRU ring measures real time, not the
+        // number of swap events (which can stall when the ring is idle)
+        if (!is_prefill) {
+            for (auto & st : lru_states) {
+                ++st.clock;
+            }
+        }
+
+        if (pending.empty() && !model.layers.empty()) {
+            pending.resize(model.layers.size());
+        }
+
+        const auto & snaps = res->get_moe_snaps();
+        if (lru_dbg_once) {
+            lru_dbg_once = false;
+            fprintf(stderr, "EXPERTLRU-DBG snaps=%zu first_snap=%p K=%d apply_every=%d prefill=%d\n",
+                    snaps.size(), snaps.empty() ? (void*)nullptr : (void*) snaps[0].snap, (int) K, apply_every, (int) is_prefill);
+        }
+        for (const auto & s : snaps) {
+            const ggml_tensor * ids = s.snap;
+            if (ids == nullptr || ids->type != GGML_TYPE_I32) {
+                continue;
+            }
+            const int n_used = ids->ne[0];
+            const int n_tok  = ids->ne[1];
+            const int64_t nelem = (int64_t) n_used * n_tok;
+            if (nelem <= 0) {
+                continue;
+            }
+            if (is_prefill) {
+                // prefill: harvest routing statistics into candidate_count,
+                // never spend a 19MB copy inside the dense pass
+                if (prefill_stats && (uint32_t) s.il < model.layers.size()) {
+                    std::vector<int32_t> buf(nelem);
+                    ggml_backend_tensor_get(ids, buf.data(), 0, nelem * sizeof(int32_t));
+                    const llama_layer & layer = model.layers[s.il];
+                    if (layer.ffn_hot_remap != nullptr && layer.ffn_up_exps_hot != nullptr && layer.ffn_up_exps != nullptr) {
+                        llm_expert_lru::LayerTensors lt;
+                        lt.hot_up     = layer.ffn_up_exps_hot;
+                        lt.hot_gate   = layer.ffn_gate_exps_hot;
+                        lt.hot_down   = layer.ffn_down_exps_hot;
+                        lt.cold_up    = layer.ffn_up_exps;
+                        lt.cold_gate  = layer.ffn_gate_exps;
+                        lt.cold_down  = layer.ffn_down_exps;
+                        lt.remap      = layer.ffn_hot_remap;
+                        lt.cold_remap = layer.ffn_cold_remap;
+                        lt.flag       = layer.ffn_hot_flag;
+                        lt.n_hot      = layer.ffn_hot_n;
+                        lt.n_spare    = (int32_t) (layer.ffn_up_exps_hot->ne[2] - 1 - layer.ffn_hot_n);
+                        lt.n_mask     = layer.ffn_hot_n + lt.n_spare;
+                        llm_expert_lru::on_decode(lru_states, lt, s.il, buf.data(), n_used, nullptr, false); // count only
+                    }
+                }
+            } else {
+                std::vector<int32_t> buf(nelem);
+                ggml_backend_tensor_get(ids, buf.data(), 0, nelem * sizeof(int32_t));
+                // aggregate per-layer; applied as one on_decode per layer per
+                // window instead of one per layer per token
+                if ((uint32_t) s.il < pending.size()) {
+                    pending[s.il].insert(pending[s.il].end(), buf.begin(), buf.end());
+                }
+            }
+        }
+
+        // batch apply: promote the accumulated cold experts into spare slots
+        // prefill never swaps - it only harvests statistics above
+        if (!is_prefill && ++decode_count >= apply_every) {
+            decode_count = 0;
+            window_tokens += apply_every;
+            // sliding-window boundary: reset cold-expert candidate evidence so
+            // stale recurrences can re-qualify (accumulated slot hits persist)
+            const int window_tok = std::max(1, getenv("LLAMA_EXPERT_LRU_WINDOW_TOKENS") ? std::atoi(getenv("LLAMA_EXPERT_LRU_WINDOW_TOKENS")) : 2048);
+            if (window_tokens >= window_tok) {
+                window_tokens = 0;
+                llm_expert_lru::reset_window(lru_states);
+            }
+            // the swap manager writes the remap/flag/cold_remap WEIGHTS tables
+            // and the hot spare columns; the previous graph's compute must be
+            // fully done before we mutate them (they are read by get_rows /
+            // mmid on the same device buffers).
+            ggml_backend_sched_synchronize(sched.get());
+            if (sched_cold) {
+                ggml_backend_sched_synchronize(sched_cold.get());
+            }
+            int swap_budget = std::max(0, getenv("LLAMA_EXPERT_LRU_MAX_SWAP_PER_BATCH") ? std::atoi(getenv("LLAMA_EXPERT_LRU_MAX_SWAP_PER_BATCH")) : 4096);
+            for (int32_t il = 0; il < (int32_t) pending.size(); ++il) {
+                std::vector<int32_t> & ids = pending[il];
+                if (ids.empty() || swap_budget <= 0) {
+                    continue;
+                }
+                if ((uint32_t) il >= model.layers.size()) {
+                    continue;
+                }
+                const llama_layer & layer = model.layers[il];
+                if (layer.ffn_hot_remap == nullptr || layer.ffn_up_exps_hot == nullptr || layer.ffn_up_exps == nullptr) {
+                    continue;
+                }
+                llm_expert_lru::LayerTensors lt;
+                lt.hot_up     = layer.ffn_up_exps_hot;
+                lt.hot_gate   = layer.ffn_gate_exps_hot;
+                lt.hot_down   = layer.ffn_down_exps_hot;
+                lt.cold_up    = layer.ffn_up_exps;
+                lt.cold_gate  = layer.ffn_gate_exps;
+                lt.cold_down  = layer.ffn_down_exps;
+                lt.remap      = layer.ffn_hot_remap;
+                lt.cold_remap = layer.ffn_cold_remap;
+                lt.flag       = layer.ffn_hot_flag;
+                // layout: [n_hot pinned][K spare][1 mask] => ne[2] = n_hot + K + 1
+                // n_hot/K are exact, handed over from the model loader via the
+                // layer struct (no inference from table contents)
+                lt.n_mask  = layer.ffn_hot_mask_col;
+                lt.n_hot   = layer.ffn_hot_n;
+                lt.n_spare = (int32_t) (layer.ffn_up_exps_hot->ne[2] - 1 - layer.ffn_hot_n);
+                lt.n_mask  = layer.ffn_hot_n + lt.n_spare;
+                llm_expert_lru::on_decode(lru_states, lt, il, ids.data(), (int) ids.size(), &swap_budget);
+            }
+            // drop the whole window (skipped layers included: budget leftovers
+            // are discarded, matching the old per-layer-token pending)
+            for (auto & v : pending) {
+                v.clear();
+            }
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2440,6 +2777,9 @@ ggml_cgraph * llama_context::graph_reserve(
     const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
 
     res->reset();
+    // measurement graph must span the whole model: per-layer split would leave
+    // the whole-model gf without the split layers and sched reserve would abort
+    res->set_reserve_mode(true);
 
     auto * gf = model.build_graph(gparams);
 
@@ -2487,7 +2827,8 @@ llm_graph_params llama_context::graph_params(
 
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
-                   bool   batched) {
+                   bool   batched,
+            const llama_ubatch * ubatch) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -2504,12 +2845,201 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
-    auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
-    if (status != GGML_STATUS_SUCCESS) {
-        LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+    static const bool moe_triple = getenv("GGML_MOE_TRIPLE") != nullptr;
+    ggml_status status = GGML_STATUS_SUCCESS;
+    // do not resubmit the whole-model gf here: triple mode submits per-layer graphs
+    // and the tail below, and re-splitting gf leaves node src dangling (UB abort)
+    if (!moe_triple) {
+        status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+        if (status != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+        }
     }
 
-    // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
+    // per-layer triple-subgraph pipeline (GGML_MOE_TRIPLE): submit each layer's
+    // attention graph (A_il), then its hot chain (CUDA0) in parallel with the
+    // cold chain (ROCm0), then the whole-model tail. sched_reset clears the
+    // hash/is_alloc state but keeps the galloc buffers, so every layer reuses
+    // the same memory.
+    if (moe_triple && sched_cold && gf_res_prev->get_gf_a(0) != nullptr) {
+        const char * moe_layers_str = getenv("GGML_MOE_TRIPLE_LAYERS");
+        const int moe_layers = moe_layers_str != nullptr ? atoi(moe_layers_str) : gf_res_prev->get_n_layer();
+
+        for (int il = 0; il < moe_layers; ++il) {
+            ggml_cgraph * gf_a    = gf_res_prev->get_gf_a(il);
+            ggml_cgraph * gf_hot  = gf_res_prev->get_gf_hot_layer(il);
+            ggml_cgraph * gf_cold = gf_res_prev->get_gf_cold_layer(il);
+            if (gf_a == nullptr || gf_cold == nullptr) {
+                continue;
+            }
+
+            // A_il on the layer sched: attention + norm (+ deferred merge of the
+            // previous layer's partials at the head). writes the cur/weights/
+            // selected host mirrors that hot_il and cold_il consume.
+            if (!(il == 0 && moe_prealloc_a0)) {
+                // alloc first: set_inputs below must run after galloc seals the leaf space
+                ggml_backend_sched_reset(sched_layer.get());
+                if (!ggml_backend_sched_alloc_graph(sched_layer.get(), gf_a)) {
+                    LLAMA_LOG_ERROR("%s: per-layer A[%d] alloc failed\n", __func__, il);
+                    return GGML_STATUS_ALLOC_FAILED;
+                }
+            }
+            if (il > 0 && ubatch != nullptr) {
+                gf_res_prev->set_inputs(ubatch);
+            }
+            if (moe_prealloc_a0 && il == 0) {
+                moe_prealloc_a0 = false;
+            }
+            status = ggml_backend_sched_graph_compute_async(sched_layer.get(), gf_a);
+            if (status != GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR("%s: per-layer A[%d] compute failed: %d\n", __func__, il, status);
+                return status;
+            }
+            ggml_backend_sched_synchronize(sched_layer.get());
+
+            // hot chain (CUDA0) and cold chain (ROCm0): the layer sched holds every
+            // backend, so both fire on it and split_graph routes them to CUDA0/ROCm0.
+            // GGML_MOE_TRIPLE_HC_SAME_GRAPH=1 merges the two chains into one per-layer
+            // graph (luz single-graph shape) so a single submission covers both.
+            const bool hc_same_graph = getenv("GGML_MOE_TRIPLE_HC_SAME_GRAPH") != nullptr;
+            const bool hc_deferred_join = hc_same_graph && getenv("GGML_MOE_TRIPLE_DEFERRED_JOIN") != nullptr;
+            if (hc_same_graph && gf_cold != nullptr && gf_cold->n_nodes > 0) {
+                ggml_backend_sched_reset(sched_layer.get());
+                if (hc_deferred_join) {
+                    // luz single-graph deferred join: register this layer's cold
+                    // deferred peer-copy nodes before alloc so the sched can record
+                    // the ROCm0 producer event and have the CUDA0 join wait on it
+                    ggml_backend_sched_set_deferred_peer_copy_split(sched_layer.get(), true);
+                    for (ggml_tensor * node : gf_res_prev->get_deferred_peer_copy_nodes(il)) {
+                        ggml_backend_sched_add_deferred_peer_copy_node(sched_layer.get(), node);
+                    }
+                }
+                status = ggml_backend_sched_graph_compute_async(sched_layer.get(), gf_cold);
+                if (status != GGML_STATUS_SUCCESS) {
+                    LLAMA_LOG_ERROR("%s: per-layer hc[%d] compute failed: %d\n", __func__, il, status);
+                    return status;
+                }
+            } else {
+                if (gf_hot != nullptr && gf_hot->n_nodes > 0) {
+                    ggml_backend_sched_reset(sched_layer.get());
+                    status = ggml_backend_sched_graph_compute_async(sched_layer.get(), gf_hot);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        LLAMA_LOG_ERROR("%s: per-layer hot[%d] compute failed: %d\n", __func__, il, status);
+                        return status;
+                    }
+                }
+                if (gf_cold != nullptr && gf_cold->n_nodes > 0) {
+                    ggml_backend_sched_reset(sched_cold.get());
+                    status = ggml_backend_sched_graph_compute_async(sched_cold.get(), gf_cold);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        LLAMA_LOG_ERROR("%s: per-layer cold[%d] compute failed: %d\n", __func__, il, status);
+                        return status;
+                    }
+                }
+            }
+            // both must finish before the next layer re-allocs the shared galloc
+            // buffers (sched_reset keeps them; a fresh alloc_graph would reuse
+            // memory the running hot/cold kernels still read or write)
+            ggml_backend_sched_synchronize(sched_cold.get());
+            ggml_backend_sched_synchronize(sched_layer.get());
+        }
+
+        // whole-model tail: remaining layers (moe_layers..n_layer) plus the head
+        // live in the whole-model graphs; their first input is the last per-layer
+        // layer_in mirror with the final deferred merge already applied at build.
+        ggml_cgraph * gf_tail  = gf_res_prev->get_gf();
+        ggml_cgraph * gf_hot   = gf_res_prev->get_gf_hot();
+        ggml_cgraph * gf_cold  = gf_res_prev->get_gf_cold();
+        const bool tail_has_chains = (gf_hot != nullptr && gf_hot->n_nodes > 0) ||
+                                     (gf_cold != nullptr && gf_cold->n_nodes > 0);
+        if (gf_tail != nullptr && gf_tail->n_nodes > 0) {
+            if (!tail_has_chains) {
+                // every layer was already split into per-layer subgraphs, so the
+                // tail is only the head graph: one submission suffices
+                status = ggml_backend_sched_graph_compute_async(sched.get(), gf_tail);
+                if (status != GGML_STATUS_SUCCESS) {
+                    LLAMA_LOG_ERROR("%s: tail graph compute failed: %d\n", __func__, status);
+                    return status;
+                }
+                ggml_backend_sched_synchronize(sched.get());
+            } else {
+                // pass 1: compute the attention chain so the cur mirrors are fresh.
+                // no reset: the main sched still holds the process_ubatch allocation
+                // of gf (is_alloc=true), so compute_async reuses the existing splits
+                // instead of re-splitting the same cgraph (split_graph rewrites node
+                // src; a second split after the fresh sched ctx leaves them dangling).
+                status = ggml_backend_sched_graph_compute_async(sched.get(), gf_tail);
+                if (status != GGML_STATUS_SUCCESS) {
+                    LLAMA_LOG_ERROR("%s: tail graph pass 1 failed: %d\n", __func__, status);
+                    return status;
+                }
+                ggml_backend_sched_synchronize(sched.get());
+
+                // hot chain (CUDA0) in parallel with the cold chain (ROCm0). both
+                // read the cur mirror written by the tail pass 1. the layer sched
+                // owns the tail hot graph; the cold sched still holds its own
+                // process_ubatch allocation (no reset, same reason as above).
+                if (gf_hot != nullptr && gf_hot->n_nodes > 0) {
+                    ggml_backend_sched_reset(sched_layer.get());
+                    status = ggml_backend_sched_graph_compute_async(sched_layer.get(), gf_hot);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        LLAMA_LOG_ERROR("%s: tail hot compute failed: %d\n", __func__, status);
+                        return status;
+                    }
+                }
+                if (gf_cold != nullptr && gf_cold->n_nodes > 0) {
+                    status = ggml_backend_sched_graph_compute_async(sched_cold.get(), gf_cold);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        LLAMA_LOG_ERROR("%s: tail cold compute failed: %d\n", __func__, status);
+                        return status;
+                    }
+                }
+                ggml_backend_sched_synchronize(sched_cold.get());
+                ggml_backend_sched_synchronize(sched_layer.get());
+                ggml_backend_sched_synchronize(sched.get());
+
+                // pass 2: replay so every tail merge reads the fresh moe_host /
+                // hot_moe_host mirrors (same idempotent replay as the dual-graph mode)
+                status = ggml_backend_sched_graph_compute_async(sched.get(), gf_tail);
+                if (status != GGML_STATUS_SUCCESS) {
+                    LLAMA_LOG_ERROR("%s: tail graph pass 2 failed: %d\n", __func__, status);
+                    return status;
+                }
+                ggml_backend_sched_synchronize(sched.get());
+            }
+        }
+
+        return status;
+    }
+
+    // submit the cold MoE chain graph on the second scheduler (ROCm0)
+    if (sched_cold) {
+        ggml_cgraph * gf_cold = gf_res_prev->get_gf_cold();
+        if (gf_cold != nullptr && gf_cold->n_nodes > 0) {
+            // Default serial handshake (correct, not parallel):
+            //   main (writes cur_cold) -> sync -> cold (writes moe_host) -> sync -> main (merge).
+            // The second main run is an idempotent replay so final logits are correct.
+            //
+            // The subtlety: main's graph contains BOTH the hot chain AND the cold
+            // merge.  With cold on a second sched we cannot split main into
+            // pre-merge/merge halves cheaply, so the first main run also executes
+            // every merge against a stale moe_host.  That stale-only output is
+            // discarded by the replay, so correctness is preserved.
+            //
+            // GGML_MOE_ASYNC=1: fire both graphs without any inter-sched wait.
+            // Racy: cold may read cur_cold before main wrote it (pair A) and
+            // main's merge may read moe_host before cold wrote it (pair B).
+            static const bool moe_async = getenv("GGML_MOE_ASYNC") != nullptr;
+            if (moe_async) {
+                ggml_backend_sched_graph_compute_async(sched_cold.get(), gf_cold);
+            } else {
+                ggml_backend_sched_synchronize(sched.get());
+                ggml_backend_sched_graph_compute_async(sched_cold.get(), gf_cold);
+                ggml_backend_sched_synchronize(sched_cold.get());
+                status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+            }
+        }
+    }
 
     return status;
 }

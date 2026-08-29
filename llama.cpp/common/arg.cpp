@@ -2779,6 +2779,50 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
     add_opt(common_arg(
+        {"--hot-exp-file"}, "FILE",
+        "JSON file with per-layer hot expert lists, used by the MoE hot-expert offload surgery\n"
+        "format: {\"devices\": {\"<device>\": {\"<layer>\": [<expert ids>], ...}}, ...}\n"
+        "the device must be one of the --device devices",
+        [](common_params & params, const std::string & value) {
+            std::ifstream file(value);
+            if (!file) {
+                throw std::runtime_error(string_format("error: failed to open file '%s'\n", value.c_str()));
+            }
+            std::string content;
+            std::copy(
+                std::istreambuf_iterator<char>(file),
+                std::istreambuf_iterator<char>(),
+                std::back_inserter(content)
+            );
+            const json j = json::parse(content);
+            for (const auto & [dev, layers] : j["devices"].items()) {
+                params.moe_hot_device = dev;
+                for (const auto & [il, exps] : layers.items()) {
+                    common_params::common_moe_hot_layer layer;
+                    layer.il   = std::stoi(il);
+                    if (exps.is_array()) {
+                        layer.exps = exps.get<std::vector<int32_t>>();
+                    } else {
+                        if (exps.contains("exps") && exps["exps"].is_array()) {
+                            layer.exps = exps["exps"].get<std::vector<int32_t>>();
+                        }
+                        if (exps.contains("skip_cold")) {
+                            layer.skip_cold = exps["skip_cold"].get<bool>();
+                        }
+                        if (exps.contains("lru_spare")) {
+                            layer.lru_spare = exps["lru_spare"].get<int32_t>();
+                        }
+                        if (exps.contains("lru_prewarm") && exps["lru_prewarm"].is_array()) {
+                            layer.prewarm = exps["lru_prewarm"].get<std::vector<int32_t>>();
+                        }
+                    }
+                    params.moe_hot_exps.push_back(std::move(layer));
+                }
+                break; // only the first device in the file is used
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_HOT_EXP_FILE"));
+    add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
         [](common_params & params) {

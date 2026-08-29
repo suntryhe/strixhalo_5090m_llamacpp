@@ -10,13 +10,15 @@ static __forceinline__ int mmf_get_rows_per_block(const int cc) {
     }
 }
 
-void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const int32_t mask_col) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
     GGML_ASSERT(         dst->type == GGML_TYPE_F32);
 
 
     GGML_TENSOR_BINARY_OP_LOCALS;
+
+    GGML_UNUSED(mask_col);
 
     const size_t ts_src0 = ggml_type_size(src0->type);
     const size_t ts_src1 = ggml_type_size(src1->type);

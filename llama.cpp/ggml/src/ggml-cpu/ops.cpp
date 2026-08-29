@@ -1514,13 +1514,13 @@ static void ggml_compute_forward_mean_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
 
-    const ggml_tensor * src0 = dst->src[0];
+const ggml_tensor * src0 = dst->src[0];
 
     if (params->ith != 0) {
         return;
     }
 
-    assert(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_can_repeat(src0, dst));
 
     GGML_TENSOR_UNARY_OP_LOCALS
 

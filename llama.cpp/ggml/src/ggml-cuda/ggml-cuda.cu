@@ -68,6 +68,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/moe-fused.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -1938,12 +1939,69 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     return true;
 }
 
+// Zero the dst columns corresponding to id == -1 slots (cold-chain "not
+// activated" slots). Both mmq and mmf compact those out, leaving stale data.
+//
+// Old kernel: one thread per slot, serial scalar loop over the column
+// (ne0 up to 8192). Warp threads write addresses ne0*4 bytes apart -> ~32x
+// write amplification, and the ~16-48 block grid leaves most SMs idle.
+// New kernel: 2D grid; grid.y splits the row space so the whole block writes
+// each column together with coalesced float4 stores and the grid fills the GPU.
+static __global__ void zero_neg1_slots_kernel(
+        const int32_t * __restrict__ ids, float * __restrict__ dst,
+        const int ne0, const int n_expert_used, const int n_tokens) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = n_expert_used * n_tokens;
+    if (idx >= total || ids[idx] != -1) return;
+
+    // dst column index == flat slot index (same convention as mm_ids_helper)
+    float * col = dst + (int64_t) idx * ne0;
+    const int step = gridDim.y * blockDim.x;
+    const int base = blockIdx.y * blockDim.x + threadIdx.x;
+
+    // fast path: IQ4_XS rows are multiples of 4, pool is 128B-aligned
+    if ((ne0 & 3) == 0) {
+        float4 * col4 = reinterpret_cast<float4 *>(col);
+        const int n_vec = ne0 >> 2;
+        for (int iv = base; iv < n_vec; iv += step) {
+            col4[iv] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        return;
+    }
+
+    // safe fallback for odd ne0
+    for (int i = base; i < ne0; i += step) {
+        col[i] = 0.0f;
+    }
+}
+
+static void ggml_cuda_zero_neg1_slots(ggml_backend_cuda_context & ctx, const ggml_tensor * ids, ggml_tensor * dst) {
+    const int n_expert_used = ids->ne[0];
+    const int n_tokens      = ids->ne[1];
+    const int total = n_expert_used * n_tokens;
+    const int block = 256;
+    const int ne0 = (int) dst->ne[0];
+
+    // grid.y = row split: enough blocks to cover all SMs, and every column is
+    // written by the whole (256-thread) block instead of one serial thread.
+    const int grid_x = (total + block - 1) / block;
+    const int id = ggml_cuda_get_device();
+    const int nsm = ggml_cuda_info().devices[id].nsm;
+    const int max_grid_y = std::max(1, (ne0 + block - 1) / block);
+    const int grid_y = std::min(max_grid_y, std::max(1, (4*nsm) / grid_x));
+
+    if (getenv("GGML_MMQ_WORKLOG")) fprintf(stderr, "ZERO_NEG1 dst=%s ne0=%d slots=%d grid=%dx%d\n", ggml_get_name(dst), (int) dst->ne[0], total, grid_x, grid_y);
+    zero_neg1_slots_kernel<<<dim3(grid_x, grid_y), block, 0, ctx.stream()>>>(
+        (const int32_t *) ids->data, (float *) dst->data, ne0, n_expert_used, n_tokens);
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
+    if (getenv("GGML_MMQ_WORKLOG")) fprintf(stderr, "MMID t=%s dst_ne2=%lld\n", ggml_get_name(src0), (long long) dst->ne[2]);
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -1951,7 +2009,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    // MoE hot-expert offload: hot compact tensors are named "<orig>.hot" and carry an
+    // all-zero mask column at the last index. The kernel skips that column entirely
+    // (output stays 0). Cold tensors (no ".hot" suffix) pass mask_col = -1 (disabled).
+    // NOTE: never derive mask_col from ne02-1 unconditionally - a cold 256-expert
+    // tensor has id 255 as a valid expert. The ".hot" name is the explicit marker.
+    const char * src0_name = ggml_get_name(src0);
+    const int32_t mask_col = src0_name && strstr(src0_name, ".hot") != nullptr
+        ? (int32_t)(src0->ne[2] - 1) : -1;
+
+    if ((src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
@@ -1968,16 +2035,28 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
+        if (getenv("GGML_MMQ_WORKLOG") && ids) fprintf(stderr, "DISPATCH t=%s ne2=%lld mask_col=%d\n", src0_name, (long long) ne2, mask_col);
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
-            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+            // MoE hot-expert offload (-1 cold ids): the mmq/mf kernels compact out
+            // id == -1 slots (absent from ids_dst), leaving stale data in their
+            // dst columns; multiplied by w_cold (0) later this is finite-0 but
+            // NaN/Inf poison. Zero the -1 columns first.
+            if (ids != nullptr && mask_col == -1) {
+                ggml_cuda_zero_neg1_slots(ctx, ids, dst);
+            }
+            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst, mask_col);
             return;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
-            ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
+            if (ids != nullptr && mask_col == -1) {
+                ggml_cuda_zero_neg1_slots(ctx, ids, dst);
+            }
+            ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst, mask_col);
             return;
         }
     }
+
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
     GGML_ASSERT(ggml_cuda_mul_mat_id_needs_sync(dst, cc));
@@ -2244,6 +2323,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 default:
                     return false;
             }
+            break;
+        case GGML_OP_MOE_FUSED:
+            ggml_cuda_op_moe_fused(ctx, dst);
             break;
         case GGML_OP_NORM:
             ggml_cuda_op_norm(ctx, dst);
@@ -2598,7 +2680,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-            if (ggml_cuda_mul_mat_id_needs_sync(node, cc)) {
+            // moe: GGML_CUDA_GRAPH_FORCE overrides the mul_mat_id sync fallback
+            static const bool graph_force = getenv("GGML_CUDA_GRAPH_FORCE") != nullptr;
+            if (!graph_force && ggml_cuda_mul_mat_id_needs_sync(node, cc)) {
                 // the mul_mat_id fallback path synchronizes the stream, so we cannot use CUDA graphs
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
                 use_cuda_graph = false;
@@ -3635,6 +3719,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
 
                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                    if (getenv("GGML_MMQ_WORKLOG")) fprintf(stderr, "FUSED_MVQ t=%s ids=%d\n", ggml_get_name(src0), ids != nullptr);
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
@@ -3728,6 +3813,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
 
                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                    if (getenv("GGML_MMQ_WORKLOG")) fprintf(stderr, "FUSED_MVQ t=%s ids=%d\n", ggml_get_name(src0), ids != nullptr);
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
@@ -4257,6 +4343,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph
+        // GGML_GRAPH_REPLAY_LOG=1: sample graph replay activity (1 line / 100 launches)
+        static const bool graph_replay_log = getenv("GGML_GRAPH_REPLAY_LOG") != nullptr;
+        if (graph_replay_log) {
+            static int graph_launch_cnt = 0; if (++graph_launch_cnt % 100 == 1) fprintf(stderr, "GRAPHREPLAY cnt=%d key=%p uid=%zu\n", graph_launch_cnt, graph_key, graph->uid);
+        }
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
 #else
         GGML_UNUSED(graph_key);
@@ -4350,19 +4441,20 @@ static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_
 static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
-    if (ggml_backend_is_cuda(backend)) {
+    // The producer event belongs to another runtime when the peer copy crosses
+    // GPU vendors (CUDA + HIP): a CUDA stream cannot wait on a HIP event (and
+    // vice versa), so fall back to a host callback that blocks the stream until
+    // the producer event completes. This preserves correctness - the consumer
+    // still runs only after the producer result is visible.
+    const bool same_runtime = ggml_backend_get_device(backend) == event->device;
+    if (same_runtime) {
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t)event->context, 0));
     } else {
-#if 0
-        // untested
         auto wait_fn = [](void * user_data) {
-            ggml_backend_event_t event = (ggml_backend_event_t)user_data;
-            ggml_backend_event_synchronize(event);
+            ggml_backend_event_t ev = (ggml_backend_event_t)user_data;
+            ggml_backend_event_synchronize(ev);
         };
-
         CUDA_CHECK(cudaLaunchHostFunc(cuda_ctx->stream(), wait_fn, event));
-#endif
-        GGML_ABORT("fatal error");
     }
 }
 
@@ -4390,7 +4482,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_cuda_stream_context & stream_context = cuda_ctx->stream_context();
     stream_context.reset();
 
-    if (!use_cuda_graph || ggml_backend_cuda_get_device_count() != 1) {
+    static const bool graph_multi = getenv("GGML_CUDA_GRAPH_MULTI") != nullptr;
+    if (!use_cuda_graph || (ggml_backend_cuda_get_device_count() != 1 && !graph_multi)) {
         return;
     }
 
@@ -4969,7 +5062,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false; // TODO this could in principle be implemented though currently there is no use case.
                 }
                 if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16) {
-                    return false;
+                    // allow F16 activations with F32/BF16/quantized weights: batched
+                    // cublas converts src1 to the compute type, mmq/mmvq host
+                    // converts to F32 on the target device - the cross-device
+                    // transfer stays half-sized (F16 bytes)
+                    if (a->type != GGML_TYPE_F32 && a->type != GGML_TYPE_BF16 && !ggml_is_quantized(a->type)) {
+                        return false;
+                    }
                 }
 #ifdef GGML_USE_MUSA
                 const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
@@ -5149,9 +5248,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             } break;
         case GGML_OP_REPEAT:
             {
-                // the CUDA REPEAT path only implements F32/F16; other types assert at runtime
+                // I32 supported for MoE remap tables (pure data copy via bin_bcast)
                 ggml_type src0_type = op->src[0]->type;
-                return src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_F16;
+                return src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_F16 || src0_type == GGML_TYPE_I32;
             } break;
         case GGML_OP_REPEAT_BACK:
                 return op->type == GGML_TYPE_F32 && (op->src[0]->ne[2]*op->src[0]->ne[3]) <= (1 << 15);
@@ -5350,6 +5449,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
 
+        case GGML_OP_MOE_FUSED:
+            return true;
+
         default:
             return false;
     }
@@ -5383,10 +5485,9 @@ static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const gg
 }
 
 static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_t dev) {
-#ifdef GGML_CUDA_NO_PEER_COPY
-    GGML_UNUSED(dev);
-    return nullptr;
-#else
+    // Events are pure synchronization primitives and are needed for deferred
+    // peer-copy joins even when direct peer access is disabled (cross-vendor
+    // CUDA+HIP): the consumer waits via a host callback in that case.
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *)dev->context;
 
     ggml_cuda_set_device(dev_ctx->device);
@@ -5398,7 +5499,6 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
         /* .device  = */ dev,
         /* .context = */ event,
     };
-#endif
 }
 
 static void ggml_backend_cuda_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {

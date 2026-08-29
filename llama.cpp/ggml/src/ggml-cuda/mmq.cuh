@@ -1149,7 +1149,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx, const int32_t mask_col, const int32_t * __restrict__ expert_map) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
@@ -1184,6 +1184,9 @@ static __global__ void mul_mat_q(
         const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
         const int wt = tmp2.x;
         const int zt = tmp2.y;
+        // Grid z was trimmed to n_nonempty: map the compact zt back to the original
+        // expert id before indexing expert_bounds / masks / weight channels.
+        const int ze = expert_map ? expert_map[zt] : zt;
         const int jt = blockIdx.y;
         const int it = blockIdx.x;
 
@@ -1191,18 +1194,18 @@ static __global__ void mul_mat_q(
         int col_low    = 0;
         int col_high   = ncols_dst;
         int col_diff   = ncols_dst;
-        int offset_y       = wt*stride_sample_y   + zt*stride_channel_y;
-        int offset_dst     = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst;
+        int offset_y       = wt*stride_sample_y   + ze*stride_channel_y;
+        int offset_dst     = wt*stride_sample_dst + ze*stride_channel_dst + jt*J*stride_col_dst;
         int offset_y_scale;
         if constexpr (type == GGML_TYPE_NVFP4) {
-            offset_y_scale = wt*nchannels_y.z*ncols_y + zt*ncols_y;
+            offset_y_scale = wt*nchannels_y.z*ncols_y + ze*ncols_y;
         } else {
             GGML_UNUSED(offset_y_scale);
         }
 
         if (ids_dst) {
-            col_low  = expert_bounds[zt + 0];
-            col_high = expert_bounds[zt + 1];
+            col_low  = expert_bounds[ze + 0];
+            col_high = expert_bounds[ze + 1];
             col_diff = col_high - col_low;
 
             offset_y   = 0;
@@ -1229,6 +1232,30 @@ static __global__ void mul_mat_q(
             __syncthreads();
         }
 
+        // MoE hot-expert offload: the mask column is all-zero, skip its computation
+        // and write zeros to the dst positions of this expert channel's tokens.
+        if (ids_dst && ze == mask_col) {
+#pragma unroll
+            for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
+                const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+                if (j0 + nwarps*warp_size > J && j >= J) {
+                    break;
+                }
+                if (jt*J + j >= col_diff) {
+                    break;
+                }
+                const int dst_col = ids_dst_shared[j];
+                for (int i0 = 0; i0 < I; i0 += warp_size) {
+                    const int i = i0 + threadIdx.x;
+                    if (it*I + i >= nrows_x) {
+                        break;
+                    }
+                    dst[dst_col*stride_col_dst + it*I + i] = 0.0f;
+                }
+            }
+            return;
+        }
+
         offset_y   += (col_low + jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
         offset_dst += it*I;
         const float * y_scale_tile = nullptr;
@@ -1240,7 +1267,7 @@ static __global__ void mul_mat_q(
         const int tile_x_max_i = nrows_x  - it*I - 1;
         const int tile_y_max_j = col_diff - jt*J - 1;
 
-        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(ze, channel_ratio)*stride_channel_x + it*I*stride_row_x;
 
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, J, fallback, fixup>
@@ -1572,6 +1599,9 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
+    int32_t mask_col;
+    int32_t n_nonempty; // number of experts with non-zero column range (grid z for ids)
+    const int32_t * expert_map; // compact zt -> original expert id (nullptr = identity)
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1606,7 +1636,12 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
     const int ntx  = (args.ncols_max + config.J - 1) / config.J;
     const int ntzw = args.nchannels_y * args.nsamples_y;
-    const dim3 block_nums_xy_tiling(nty, ntx, ntzw);
+    // Grid-z trim for MoE ids: only experts with a non-empty compact column range
+    // (col_diff > 0) get a grid slice. blockIdx.z stays < nchannels_y, so the
+    // fast_div_modulo decode gives zt = blockIdx.z; the kernel maps it back to the
+    // original expert id via expert_map. Stream-K is not trimmed (passes nullptr).
+    const int ntzw_eff = args.expert_map ? args.n_nonempty : ntzw;
+    const dim3 block_nums_xy_tiling(nty, ntx, ntzw_eff);
 
     GGML_ASSERT(args.nchannels_y % args.nchannels_x == 0);
     GGML_ASSERT(args.nsamples_y  % args.nsamples_x  == 0);
@@ -1620,13 +1655,15 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
+    // Note: mask_col (MoE hot-expert offload) is safe on the stream-K path: the mask
+    // column is all-zero weights, so its computed output is 0 regardless of tiling.
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
         mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, args.mask_col, args.expert_map);
         return;
     }
 
@@ -1655,7 +1692,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, args.mask_col, nullptr);
 
     if (!fixup_needed) {
         return;
@@ -1834,6 +1871,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 // -------------------------------------------------------------------------------------------------------------------------
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const int32_t mask_col = -1);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);

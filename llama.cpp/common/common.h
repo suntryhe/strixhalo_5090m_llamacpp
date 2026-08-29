@@ -470,6 +470,19 @@ struct common_params {
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
+    // MoE hot-expert offload surgery
+    struct common_moe_hot_layer {
+        int32_t            il;   // block (layer) index
+        std::vector<int32_t> exps; // hot expert ids in this layer
+        bool skip_cold      = false; // when the config covers all experts a layer can activate,
+                                     // the cold chain can be removed from the graph entirely
+        int32_t lru_spare   = -1; // spare LRU slots for this layer; -1 = fall back to env
+        std::vector<int32_t> prewarm; // experts pre-loaded into the LRU spare slots
+    };
+    std::string                     moe_hot_device;     // device that receives compact hot expert copies (e.g. "CUDA0")
+    std::vector<common_moe_hot_layer> moe_hot_exps;     // per-layer hot expert lists; empty disables the surgery
+    std::vector<llama_model_moe_hot_exp> moe_hot_exp_cfg; // rebuilt by common_model_params_to_llama (il = -1 terminated)
+
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs

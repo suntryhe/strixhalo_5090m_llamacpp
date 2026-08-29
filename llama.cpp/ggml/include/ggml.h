@@ -590,8 +590,48 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MOE_FUSED,
+
         GGML_OP_COUNT,
     };
+
+    // GGML_OP_MOE_FUSED multiplexes a small family of GPU-only MoE helpers.
+    // Parameter zero normally contains n_embd; negative values identify the
+    // specialized sub-operation.
+    enum ggml_moe_fused_subop {
+        GGML_MOE_FUSED_COMBINE            = -1,
+        GGML_MOE_FUSED_OWNER              = -2,
+        GGML_MOE_FUSED_DEFERRED_PEER_COPY = -3,
+        GGML_MOE_FUSED_OWNER_SPLIT        = -4,
+        GGML_MOE_FUSED_ALIGN_IDS          = -5,
+    };
+
+    // Word offsets in ggml_tensor::op_params for the deferred peer-copy op.
+    // Both pointers start at naturally aligned 64-bit boundaries.
+    enum ggml_moe_fused_deferred_peer_param {
+        GGML_MOE_FUSED_DEFERRED_EVENT_WORD         = 2,
+        GGML_MOE_FUSED_DEFERRED_SOURCE_WORD        = 4,
+        GGML_MOE_FUSED_DEFERRED_EXTERNAL_WAIT_WORD = 7,
+    };
+
+    // fused MoE FFN: gate/up/down + routing weights in one kernel. GPU-only,
+    // decode (single token) only, IQ2_XS/IQ3_XXS (gate/up), +IQ4_XS (down).
+    // the sh_* tensors are optional shared-expert weights (unused for now).
+    GGML_API struct ggml_tensor * ggml_moe_fused(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * input,
+            struct ggml_tensor  * gate_w,
+            struct ggml_tensor  * up_w,
+            struct ggml_tensor  * down_w,
+            struct ggml_tensor  * expert_ids,
+            struct ggml_tensor  * expert_wts,
+            struct ggml_tensor  * sh_gate_w,
+            struct ggml_tensor  * sh_up_w,
+            struct ggml_tensor  * sh_down_w,
+            struct ggml_tensor  * sh_gate_inp_w,
+            int64_t               n_embd,
+            int64_t               ff_dim,
+            int64_t               n_expert_used);
 
     enum ggml_unary_op {
         GGML_UNARY_OP_ABS,
@@ -2807,6 +2847,13 @@ extern "C" {
     GGML_API void ggml_build_forward_order(
             struct ggml_cgraph * cgraph,
             struct ggml_tensor * tensor);
+
+    // Deferred peer-copy op: producer backend completes `src` on another
+    // device, the scheduler records an event, and the consumer backend waits
+    // on it before its split reads the result. Avoids a full per-input sync.
+    GGML_API struct ggml_tensor * ggml_ds4_deferred_peer_copy(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * src);
 
     GGML_API void ggml_build_backward_expand(
         struct ggml_context *  ctx,        // context for gradient computation

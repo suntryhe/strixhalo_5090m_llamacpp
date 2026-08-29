@@ -108,6 +108,7 @@ endif()
 
 if (GGML_HIP_GRAPHS)
     add_compile_definitions(GGML_HIP_GRAPHS)
+    add_compile_definitions(USE_CUDA_GRAPH)
 endif()
 
 if (GGML_HIP_NO_VMM)

@@ -1713,6 +1713,25 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
+    // rebuild the hot-expert config array from the owning lists on every call so the
+    // entries' exps pointers always reference storage owned by this params object
+    params.moe_hot_exp_cfg.clear();
+    if (!params.moe_hot_device.empty() && !params.moe_hot_exps.empty()) {
+        for (const auto & layer : params.moe_hot_exps) {
+            // a layer with no pinned experts is only kept when it declares
+            // lru_spare>0 (pure-spare layer, all slots filled by the LRU ring)
+            if (layer.exps.empty() && layer.lru_spare <= 0) {
+                continue; // fully cold layer, no hot columns at all
+            }
+            params.moe_hot_exp_cfg.push_back({ layer.il, (int32_t) layer.exps.size(), layer.exps.data(), layer.skip_cold, layer.lru_spare, (int32_t) layer.prewarm.size(), layer.prewarm.data() });
+        }
+        if (!params.moe_hot_exp_cfg.empty()) {
+            params.moe_hot_exp_cfg.push_back({ -1, 0, nullptr, false, -1 });
+            mparams.moe_hot_exps   = params.moe_hot_exp_cfg.data();
+            mparams.moe_hot_device = params.moe_hot_device.c_str();
+        }
+    }
+
     return mparams;
 }
 

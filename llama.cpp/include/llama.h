@@ -310,6 +310,20 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
+    // [EXPERIMENTAL] MoE hot-expert offload surgery
+    // Per-layer list of "hot" experts whose weights are additionally copied to a dedicated device (e.g. CUDA0)
+    // and computed in parallel with the full "cold" MoE mmid on the primary device (e.g. ROCm0).
+    // A NULL-terminated array of these is passed in llama_model_params::moe_hot_exps (il = -1 marks the end).
+    struct llama_model_moe_hot_exp {
+        int32_t il;           // layer index
+        int32_t n_exps;       // number of hot experts in this layer
+        const int32_t * exps; // [n_exps] global expert ids (expert column index in the weight tensor)
+        bool skip_cold;       // remove the cold chain from the graph for this layer
+        int32_t lru_spare;    // spare LRU slots for this layer; -1 = fall back to env
+        int32_t n_prewarm;    // number of experts pre-loaded into the LRU spare slots
+        const int32_t * prewarm; // [n_prewarm] spare-slot experts, loaded at model load time
+    };
+
     struct llama_model_params {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
@@ -339,6 +353,12 @@ extern "C" {
 
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
+
+        // [EXPERIMENTAL] NULL-terminated list of per-layer hot-expert configs (see llama_model_moe_hot_exp)
+        const struct llama_model_moe_hot_exp * moe_hot_exps;
+
+        // [EXPERIMENTAL] device name (e.g. "CUDA0") that receives the compact hot-expert weight copies, NULL disables the surgery
+        const char * moe_hot_device;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
@@ -1564,6 +1584,11 @@ extern "C" {
     // The logger state is global so these functions are NOT thread safe.
     LLAMA_API void llama_log_get(ggml_log_callback * log_callback, void ** user_data);
     LLAMA_API void llama_log_set(ggml_log_callback   log_callback, void *  user_data);
+
+    // MoE expert LRU cache: cumulative hit counters split by phase (prefill vs
+    // decode), for the /metrics endpoint. All outputs zero when LRU is disabled.
+    LLAMA_API void llama_moe_lru_hit_counts(uint64_t * prefill_sel, uint64_t * prefill_hit,
+                                            uint64_t * decode_sel,  uint64_t * decode_hit);
 
     //
     // Performance utils

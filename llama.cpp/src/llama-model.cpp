@@ -1813,7 +1813,276 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    setup_moe_hot_exps();
+
     return true;
+}
+
+// copies the per-layer hot expert weight columns into compact tensors on the hot device,
+    // plus the remap/flag tables used by build_moe_ffn to split ids and weights between the two branches
+    void llama_model_base::setup_moe_hot_exps() {
+        if (params.moe_hot_exps == nullptr || params.moe_hot_device == nullptr) {
+            return;
+        }
+
+        // LRU expert cache ring: spare slots appended after the pinned hot experts,
+        // plus a final zero mask column. The mask column index shifts to
+        // n_hot + n_lru_slots (runtime swaps use the spare/ binding below).
+        // The spare columns are initialized to zero (a zero expert), so a slot
+        // not yet bound by a runtime swap produces a zero contribution.
+
+    ggml_backend_dev_t hot_dev = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const enum ggml_backend_dev_type dtype = ggml_backend_dev_type(dev);
+        if ((dtype == GGML_BACKEND_DEVICE_TYPE_GPU || dtype == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
+                strcmp(ggml_backend_dev_name(dev), params.moe_hot_device) == 0) {
+            hot_dev = dev;
+            fprintf(stderr, "MOEHOT device %s type=%d matched\n", params.moe_hot_device, (int) dtype);
+            break;
+        }
+    }
+    // allow CPU as hot device (used for graph-logic validation without GPUs)
+    if (hot_dev == nullptr) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && strcmp(ggml_backend_dev_name(dev), params.moe_hot_device) == 0) {
+                hot_dev = dev;
+                fprintf(stderr, "MOEHOT device %s type=CPU matched\n", params.moe_hot_device);
+                break;
+            }
+        }
+    }
+    if (hot_dev == nullptr) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            fprintf(stderr, "MOEHOT available device %zu: name=%s type=%d\n",
+                    i, ggml_backend_dev_name(dev), (int) ggml_backend_dev_type(dev));
+        }
+        throw std::runtime_error(format("moe_hot_device %s not found", params.moe_hot_device));
+    }
+    ggml_backend_buffer_type_t hot_buft = ggml_backend_dev_buffer_type(hot_dev);
+    GGML_ASSERT(hot_buft != nullptr);
+
+    ggml_init_params init_params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * 1024,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx_hot = ggml_init(init_params);
+    if (ctx_hot == NULL) {
+        throw std::runtime_error("failed to create ggml context for MoE hot experts");
+    }
+
+
+    int n_hot_layers = 0;
+
+    for (const llama_model_moe_hot_exp * cfg = params.moe_hot_exps; cfg->il >= 0; ++cfg) {
+        const bool pure_spare = cfg->n_exps == 0 && cfg->lru_spare > 0; // 0 pinned hot, all slots are LRU spare
+        if (cfg->il >= (int32_t) layers.size() || cfg->lru_spare < -1) {
+            throw std::runtime_error(format("invalid MoE hot expert config for layer %d", cfg->il));
+        }
+        if (!pure_spare && (cfg->n_exps <= 0 || cfg->exps == nullptr)) {
+            throw std::runtime_error(format("invalid MoE hot expert config for layer %d", cfg->il));
+        }
+        // hash-routed layers (DeepSeek-V4 blk.0..hash_layer_count-1) select experts via the
+        // tid->eid table, not top-k, so the hot/cold id-split machinery does not apply; skip
+        // them and keep those layers fully on the cold device to avoid a CUDA OOB access.
+        if ((uint32_t) cfg->il < hparams.dsv4_hash_layer_count) {
+            fprintf(stderr, "MOEHOT skip hash-routed layer %d (hash_layer_count=%u)\n", cfg->il, hparams.dsv4_hash_layer_count);
+            continue;
+        }
+        llama_layer & layer = layers[cfg->il];
+        n_hot_layers++;
+
+        ggml_tensor * src_tensors[3] = { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps };
+        ggml_tensor ** dst_tensors[3] = { &layer.ffn_gate_exps_hot, &layer.ffn_up_exps_hot, &layer.ffn_down_exps_hot };
+
+        if (src_tensors[0] == nullptr || src_tensors[1] == nullptr || src_tensors[2] == nullptr) {
+            throw std::runtime_error(format("layer %d is missing exps tensors required for MoE hot offload", cfg->il));
+        }
+
+        // down projection uses its own quant type (and a transposed layout), keep every tensor as-is
+        const int64_t ne2   = src_tensors[0]->ne[2];
+        const int32_t n_hot = cfg->n_exps;
+        // per-layer LRU spare slots from the hot config (0 = no spares, layer fully cold)
+        const int lru_slots = cfg->lru_spare >= 0 ? cfg->lru_spare : 0;
+        layer.ffn_hot_n        = n_hot;
+        layer.ffn_hot_mask_col = n_hot + lru_slots;
+        if (lru_slots > 0) {
+            fprintf(stderr, "MOEHOT layer %d: %d lru spare slots\n", cfg->il, lru_slots);
+        }
+
+        // one extra column: a zero expert used to mask cold slots in the hot branch
+        // plus any LRU spare-slot columns (also zero-initialized)
+        const int64_t ne2_hot = n_hot + 1 + lru_slots;
+
+        for (int t = 0; t < 3; ++t) {
+            ggml_tensor * src = src_tensors[t];
+            GGML_ASSERT(src->ne[2] == ne2 && "all exps tensors must share n_expert");
+
+            ggml_tensor * hot = ggml_new_tensor_3d(ctx_hot, src->type, src->ne[0], src->ne[1], ne2_hot);
+            ggml_set_name(hot, (std::string(ggml_get_name(src)) + ".hot").c_str());
+            *dst_tensors[t] = hot;
+        }
+
+
+        ggml_tensor * remap = ggml_new_tensor_1d(ctx_hot, GGML_TYPE_I32, ne2);
+        ggml_set_name(remap, (format("blk.%d.ffn_hot_remap", cfg->il)).c_str());
+        layer.ffn_hot_remap = remap;
+
+        ggml_tensor * cold_remap = ggml_new_tensor_1d(ctx_hot, GGML_TYPE_I32, ne2);
+        ggml_set_name(cold_remap, (format("blk.%d.ffn_cold_remap", cfg->il)).c_str());
+        layer.ffn_cold_remap = cold_remap;
+
+        ggml_tensor * flag = ggml_new_tensor_1d(ctx_hot, GGML_TYPE_F32, ne2);
+        ggml_set_name(flag, (format("blk.%d.ffn_hot_flag", cfg->il)).c_str());
+        layer.ffn_hot_flag = flag;
+
+        // the hot config covers every expert this layer can activate (declared by the
+        // config's skip_cold flag, or implicit when it lists the full expert count):
+        // the cold chain is dead weight, remove it from the graph entirely
+        if (cfg->skip_cold || (uint32_t) n_hot >= (uint32_t) ne2) {
+            layer.ffn_hot_cold_skip = true;
+            fprintf(stderr, "MOEHOT layer %d: full coverage (%d/%d), cold chain removed\n", cfg->il, n_hot, (int) ne2);
+        }
+    }
+
+    if (n_hot_layers == 0) {
+        fprintf(stderr, "MOEHOT all layers skipped by hash-routing filter, hot offload disabled\n");
+        ggml_free(ctx_hot);
+        return;
+    }
+
+    ggml_backend_buffer_t buf_hot = ggml_backend_alloc_ctx_tensors_from_buft(ctx_hot, hot_buft);
+    if (buf_hot == nullptr) {
+        throw std::runtime_error(format("failed to allocate MoE hot expert buffer on %s", params.moe_hot_device));
+    }
+
+    // mark as weights so the sched keeps the hot chain mmid on CUDA0 (avoids cross-vendor copy per layer)
+    ggml_backend_buffer_set_usage(buf_hot, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+
+    std::vector<char> col_buf;
+
+    // read-back verification of every copied hot column is off by default
+    // (MOEHOT_VERIFY=1 enables it); each verified column costs an extra
+    // full-column D2H read-back over PCIe, doubling the load-path traffic
+    const bool moehot_verify = getenv("MOEHOT_VERIFY") != nullptr;
+
+    for (const llama_model_moe_hot_exp * cfg = params.moe_hot_exps; cfg->il >= 0; ++cfg) {
+        const int32_t il = cfg->il;
+        if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
+            continue;
+        }
+        const llama_layer & layer = layers[il];
+        const int32_t n_hot = cfg->n_exps;
+        const int64_t ne2 = layer.ffn_gate_exps->ne[2];
+        const int32_t lru_slots = cfg->lru_spare >= 0 ? cfg->lru_spare : 0;
+        const int32_t n_prewarm = cfg->n_prewarm > 0 && cfg->prewarm != nullptr ? cfg->n_prewarm : 0;
+
+        std::vector<int32_t> remap_data(ne2, (int32_t)(n_hot + lru_slots));
+        std::vector<int32_t> cold_remap_data(ne2);
+        std::vector<float>   flag_data(ne2, 0.0f);
+
+        for (int32_t i = 0; i < n_hot; ++i) {
+            const int32_t e = cfg->exps[i];
+            if (e >= ne2) {
+                throw std::runtime_error(format("layer %d hot expert %d out of range (n_expert = %lld)", il, e, (long long) ne2));
+            }
+            remap_data[e] = i;
+            flag_data[e]  = 1.0f;
+        }
+        // prewarm: pre-load the LRU spare slots (col n_hot+1+s) from the config
+        // so the ring starts warm instead of counting from zero at runtime
+        for (int32_t s = 0; s < n_prewarm && s < lru_slots; ++s) {
+            const int32_t e = cfg->prewarm[s];
+            if (e >= 0 && e < ne2) {
+                remap_data[e] = n_hot + s;
+                flag_data[e]  = 1.0f;
+            }
+        }
+        for (int32_t e = 0; e < ne2; ++e) {
+            cold_remap_data[e] = flag_data[e] != 0.0f ? -1 : e;
+        }
+
+        ggml_backend_tensor_set(layer.ffn_hot_remap, remap_data.data(), 0, sizeof(int32_t)*ne2);
+        ggml_backend_tensor_set(layer.ffn_cold_remap, cold_remap_data.data(), 0, sizeof(int32_t)*ne2);
+        ggml_backend_tensor_set(layer.ffn_hot_flag,  flag_data.data(), 0, sizeof(float)*ne2);
+
+        ggml_tensor * srcs[3] = { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps };
+        ggml_tensor * dsts[3] = { layer.ffn_gate_exps_hot, layer.ffn_up_exps_hot, layer.ffn_down_exps_hot };
+
+        for (int t = 0; t < 3; ++t) {
+            ggml_tensor * src = srcs[t];
+            ggml_tensor * dst = dsts[t];
+
+            const size_t col_size = ggml_row_size(src->type, src->ne[0]) * src->ne[1];
+            if (col_buf.size() < col_size) {
+                col_buf.resize(col_size);
+            }
+
+            for (int32_t i = 0; i < n_hot; ++i) {
+                const int32_t e = cfg->exps[i];
+                ggml_backend_tensor_get(src, col_buf.data(), (size_t) e*col_size, col_size);
+                ggml_backend_tensor_set(dst, col_buf.data(), (size_t) i*col_size, col_size);
+
+                if (moehot_verify) {
+                    std::vector<uint8_t> rb(col_size);
+                    ggml_backend_tensor_get(dst, rb.data(), (size_t) i*col_size, col_size);
+                    if (memcmp(col_buf.data(), rb.data(), col_size) != 0) {
+                        fprintf(stderr, "COPYVERIFY-FAIL layer %d tensor %d expert %d (-> col %d)\n",
+                                il, t, e, i);
+                    }
+                }
+            }
+            // prewarm: also copy the pre-loaded spare-slot experts (col n_hot+1+s)
+            for (int32_t s = 0; s < n_prewarm && s < lru_slots; ++s) {
+                const int32_t e = cfg->prewarm[s];
+                if (e < 0 || e >= ne2) {
+                    continue;
+                }
+                ggml_backend_tensor_get(src, col_buf.data(), (size_t) e*col_size, col_size);
+                ggml_backend_tensor_set(dst, col_buf.data(), (size_t)(n_hot + s)*col_size, col_size);
+            }
+
+            if (moehot_verify) {
+                fprintf(stderr, "COPYVERIFY-OK layer %d tensor %d col_size=%zu verified %d hot cols (type=%d ne0=%lld ne1=%lld)\n",
+                        il, t, col_size, n_hot, (int) src->type, (long long) src->ne[0], (long long) src->ne[1]);
+            }
+
+            // all bits zero decodes to zero for IQ4_XS
+            std::memset(col_buf.data(), 0, col_size);
+            ggml_backend_tensor_set(dst, col_buf.data(), (size_t) n_hot*col_size, col_size);
+            // LRU spare columns also start as zero experts; the runtime swap
+            // manager overwrites them with real cold-expert weights on demand
+            for (int32_t s = 0; s < lru_slots; ++s) {
+                ggml_backend_tensor_set(dst, col_buf.data(), (size_t)(n_hot + 1 + s)*col_size, col_size);
+            }
+        }
+
+
+        std::vector<int32_t> remap_rb(ne2);
+        std::vector<float>   flag_rb(ne2);
+        ggml_backend_tensor_get(layer.ffn_hot_remap, remap_rb.data(), 0, sizeof(int32_t)*ne2);
+        ggml_backend_tensor_get(layer.ffn_hot_flag,  flag_rb.data(), 0, sizeof(float)*ne2);
+        // pure-spare layers (n_hot=0) have an empty exps list; guard the print
+        const int32_t exps0 = n_hot > 0 ? cfg->exps[0] : 0;
+        fprintf(stderr, "TABLES layer %d remap[0..5]=%d,%d,%d,%d,%d,%d flag[0..5]=%d,%d,%d,%d,%d,%d remap[exps0]=%d flag[exps0]=%d\n",
+                il,
+                remap_rb[0], remap_rb[1], remap_rb[2], remap_rb[3], remap_rb[4], remap_rb[5],
+                (int) flag_rb[0], (int) flag_rb[1], (int) flag_rb[2], (int) flag_rb[3], (int) flag_rb[4], (int) flag_rb[5],
+                remap_rb[exps0], (int) flag_rb[exps0]);
+
+        fprintf(stderr, "HOTCOPY layer %3d: %d/%lld hot experts copied to %s as %s\n",
+                il, n_hot, (long long) ne2, params.moe_hot_device, ggml_backend_buft_name(hot_buft));
+    }
+
+    // keep the context and buffer alive for the lifetime of the model, same as the regular weight tensors
+    std::vector<ggml_backend_buffer_ptr> hot_bufs;
+    hot_bufs.emplace_back(buf_hot);
+    pimpl->ctxs_bufs.emplace_back(ggml_context_ptr(ctx_hot), std::move(hot_bufs));
+
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -2687,6 +2956,8 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.moe_hot_exps                =*/ nullptr,
+        /*.moe_hot_device              =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

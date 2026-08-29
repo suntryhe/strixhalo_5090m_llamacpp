@@ -1,4 +1,5 @@
 #include "llama-impl.h"
+#include "llama-expert-lru.h"
 
 #include "gguf.h"
 #include "llama.h"
@@ -33,6 +34,16 @@ void llama_log_set(ggml_log_callback log_callback, void * user_data) {
     ggml_log_set(log_callback, user_data);
     g_logger_state.log_callback = log_callback ? log_callback : llama_log_callback_default;
     g_logger_state.log_callback_user_data = user_data;
+}
+
+void llama_moe_lru_hit_counts(uint64_t * prefill_sel, uint64_t * prefill_hit,
+                              uint64_t * decode_sel,  uint64_t * decode_hit) {
+    uint64_t ps = 0, ph = 0, ds = 0, dh = 0;
+    llm_expert_lru::get_hit_counts(ps, ph, ds, dh);
+    if (prefill_sel) { *prefill_sel = ps; }
+    if (prefill_hit) { *prefill_hit = ph; }
+    if (decode_sel)  { *decode_sel  = ds; }
+    if (decode_hit)  { *decode_hit  = dh; }
 }
 
 static void llama_log_internal_v(ggml_log_level level, const char * format, va_list args) {

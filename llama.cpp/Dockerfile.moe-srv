@@ -1,0 +1,61 @@
+# MoE hot-expert offload runtime image (moe-srv)
+# Base: localhost/llamacpp:moe-hotstats-planD2 (llama.cpp + CUDA + ROCm toolchain)
+# Purpose: fix the runtime env currently passed via dozens of -e/-v flags into
+#          one reproducible image; adds rocprofiler-sdk for ROCm kernel profiling.
+#
+# Build:
+#   podman build -f Dockerfile.moe-srv -t localhost/llamacpp:moe-hotstats-prof .
+#
+# Run (GPU devices + model/hotlibs mounts stay external):
+#   podman run -d --name moe-srv \
+#     --device=/dev/kfd --device=/dev/dri/card0 --device=/dev/dri/renderD128 \
+#     --device=/dev/dri/card1 --device=/dev/dri/renderD129 \
+#     --device=/dev/nvidia0 --device=/dev/nvidiactl --device=/dev/nvidia-modeset \
+#     --device=/dev/nvidia-uvm --device=/dev/nvidia-uvm-tools \
+#     --group-add=video --ipc=host --network=host --security-opt label=disable \
+#     -v /root/.cache:/root/.cache \
+#     -v /tmp/opencode/moe-out/hotlibs:/build-moe/bin \
+#     -v /tmp/opencode/nvidia-libs:/nvidia-libs \
+#     -v /opt/models:/models:ro \
+#     localhost/llamacpp:moe-hotstats-prof
+
+FROM localhost/llamacpp:moe-hotstats-planD2
+
+# ---- ROCm profiler (rocprofv3) for "is ROCm really doing less work?" checks ----
+RUN dnf install -y --setopt=install_weak_deps=False rocprofiler-sdk rocprofiler-sdk-rocpd rocprofiler-sdk-roctx \
+    && dnf clean all
+
+# ---- Runtime environment (previously passed via podman -e, now baked in) ----
+ENV GGML_HIP_DISABLE_GRAPHS=1 \
+    LLAMA_NO_FUSE_HC_POST=1 \
+    GGML_HIP=1 \
+    HSA_OVERRIDE_GFX_VERSION=11.5.1 \
+    GGML_HIP_ENABLE_UNIFIED_MEMORY=1 \
+    GGML_BACKEND_DL=1 \
+    GGML_CUDA_GRAPH_OPT=1 \
+    GGML_CUDA=1 \
+    HIP_PLATFORM=amd \
+    NVIDIA_VISIBLE_DEVICES=void \
+    HIP_PATH=/opt/rocm \
+    HIP_DEVICE_LIB_PATH=/opt/rocm/amdgcn/bitcode \
+    HIP_CLANG_PATH=/opt/rocm/llvm/bin \
+    CUDA_PATH=/usr/local/cuda \
+    CMAKE_PREFIX_PATH=/opt/rocm \
+    ROCM_PATH=/opt/rocm \
+    CUDACXX=/usr/local/cuda/bin/nvcc \
+    CUDA_HOST_COMPILER=/usr/bin/gcc \
+    GGML_MMQ_MAX_J_OCC2=64 \
+    LD_LIBRARY_PATH=/nvidia-libs:/build-moe/bin \
+    PATH=/build-moe/bin:/usr/local/bin:/opt/rocm/bin:/opt/rocm/llvm/bin:/usr/local/cuda/bin:/usr/bin
+
+# ---- Default server command (mounted libs/config come from -v, see header) ----
+ENTRYPOINT ["/build-moe/bin/llama-server"]
+CMD ["-m", "/models/DeepSeek/DeepSeek-V4-Flash-0731-UD-IQ4_XS-00001-of-00004.gguf", \
+     "-dev", "CUDA0,ROCm0", "-ngl", "999", "-ts", "1,0", \
+     "-ot", "blk\\.([3-9]|[1-2][0-9]|3[0-9]|4[0-1])\\.ffn_.*_exps\\.weight=ROCm0", \
+     "--hot-exp-file", "/build-moe/bin/hot_cfg_20l_top12_real.json", \
+     "--host", "0.0.0.0", "--port", "5234", "-n", "24000", "-c", "8192", \
+     "-fa", "on", "-b", "2047", "-ub", "2047", "-t", "2", "-tb", "2", \
+     "--parallel", "1", "--no-mmproj", "--no-mmap", "--metrics", \
+     "--temp", "0.7", "--top-p", "0.95", "--top-k", "20", \
+     "--jinja", "--fit", "off", "-ctv", "q8_0", "-ctk", "q8_0", "--numa", "distribute"]

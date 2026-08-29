@@ -341,6 +341,27 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_exps_s   = nullptr;
     struct ggml_tensor * ffn_up_exps_s     = nullptr;
 
+    // MoE hot-expert offload surgery
+    // compact copies of the hot expert columns, allocated on the dedicated hot device (e.g. CUDA0)
+    // the last column (index n_hot) is a zero expert used for masking cold slots in the hot branch
+    struct ggml_tensor * ffn_gate_exps_hot = nullptr;
+    struct ggml_tensor * ffn_down_exps_hot = nullptr;
+    struct ggml_tensor * ffn_up_exps_hot   = nullptr;
+    // global expert id -> local index in the hot tensor (n_hot for cold experts), used to remap ids
+    struct ggml_tensor * ffn_hot_remap     = nullptr;
+    // global expert id -> 1.0f for hot, 0.0f for cold, used to split the MoE weights
+    struct ggml_tensor * ffn_hot_flag      = nullptr;
+    // global expert id -> -1 for hot experts, the original id for cold experts,
+    // used by the cold mmid to skip hot slots (they are computed by the hot chain)
+    struct ggml_tensor * ffn_cold_remap    = nullptr;
+    // set when the hot config covers every expert of this layer: the cold chain is
+    // removed from the graph entirely (no cross-device transfer for this layer)
+    bool ffn_hot_cold_skip = false;
+    // exact hot-column geometry loaded from hot_cfg (per layer), used by the
+    // runtime LRU manager; no inference from tensor contents
+    int32_t ffn_hot_n       = 0; // pinned hot expert count
+    int32_t ffn_hot_mask_col= 0; // n_hot + lru_spare (zero-mask column index)
+
     // ff MoE latent proj
     struct ggml_tensor * ffn_latent_down = nullptr;
     struct ggml_tensor * ffn_latent_up   = nullptr;
@@ -810,6 +831,10 @@ struct llama_model_base : public llama_model {
     void load_hparams(llama_model_loader & ml) override;
     void load_vocab  (llama_model_loader & ml) override;
     bool load_tensors(llama_model_loader & ml) override;
+
+    // MoE hot-expert offload surgery: called at the end of load_tensors, after all weights are loaded
+    // copies the per-layer hot expert columns into compact tensors on the configured hot device
+    void setup_moe_hot_exps();
 
     // model must define these
     void load_arch_hparams(llama_model_loader & ml) override = 0;

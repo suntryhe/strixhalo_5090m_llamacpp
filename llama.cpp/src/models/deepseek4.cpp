@@ -1232,7 +1232,64 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
     cb(inpL, "hc_init", -1);
 
+    // triple-subgraph mode: expand each layer's nodes into its own graphs.
+    // GGML_MOE_TRIPLE_LAYERS limits the per-layer split to the first layers;
+    // the rest falls back to the whole-model graphs.
+    const char * moe_layers_str = getenv("GGML_MOE_TRIPLE_LAYERS");
+    const int moe_layers = moe_layers_str != nullptr ? atoi(moe_layers_str) : n_layer;
+    // reserve-mode builds a whole-model measurement graph: keep it unsplit so
+    // the single measurement gf spans every layer (split layers would not be
+    // in it and ggml_backend_sched_reserve would abort on the missing input)
+    const bool triple_active = getenv("GGML_MOE_TRIPLE") != nullptr && !res->get_reserve_mode();
+
+    // cross-graph residual channel: per-layer graphs are independent cgraphs,
+    // so the hidden state crosses the boundary through op==NONE host tensors
+    // (same pattern as cold_boundary). layer_in[il] written by layer il-1,
+    // read by layer il. per-layer mirrors for the deferred moe merge: the hot/
+    // cold partial sums and the ffn post tensor (see the merge rebuild at the
+    // layer head below).
+    std::vector<ggml_tensor *> layer_in(n_layer, nullptr);
+    std::vector<ggml_tensor *> hot_moe_host(n_layer, nullptr);
+    std::vector<ggml_tensor *> moe_host_vec(n_layer, nullptr);
+    std::vector<ggml_tensor *> post_host_vec(n_layer, nullptr);
+
     for (int il = 0; il < n_layer; ++il) {
+        const bool layer_split = triple_active && il < moe_layers;
+        if (layer_split) {
+            set_layer_graph(il);
+        } else if (triple_active) {
+            // beyond the per-layer range: close the residual channel (the last
+            // per-layer graph wrote layer_in[moe_layers-1]) and expand into the
+            // whole-model graph again
+            set_layer_graph(-1);
+        }
+
+        // per-layer: A_il = [merge_{il-1}, attn_i, norm_i]. The base residual
+        // (shared experts only, no moe) crossed via layer_in; the moe term
+        // concat_dst[(hot_moe_host + moe_host) * post_dst] is rebuilt here
+        // because hc_post is linear in its first argument.
+        if (triple_active && il > 0 && il - 1 < moe_layers) {
+            inpL = layer_in[il] != nullptr ? layer_in[il] : inpL;
+            ggml_tensor * hot  = hot_moe_host[il - 1];
+            ggml_tensor * cold = moe_host_vec [il - 1];
+            if (hot != nullptr || cold != nullptr) {
+                ggml_tensor * moe_sum = (hot != nullptr && cold != nullptr) ? ggml_add(ctx0, hot, cold)
+                                       : (hot != nullptr ? hot : cold);
+                ggml_tensor * post_p = post_host_vec[il - 1];
+                ggml_tensor * merge_term = nullptr;
+                for (int64_t dst = 0; dst < hc; ++dst) {
+                    ggml_tensor * post_dst = ggml_view_2d(ctx0, post_p, 1, n_tokens, post_p->nb[1], dst*post_p->nb[0]);
+                    ggml_tensor * cur_dst = ggml_mul(ctx0, moe_sum, post_dst);
+                    cur_dst = ggml_reshape_3d(ctx0, cur_dst, n_embd, 1, n_tokens);
+                    merge_term = merge_term ? ggml_concat(ctx0, merge_term, cur_dst, 1) : cur_dst;
+                }
+                ggml_build_forward_expand(gf, merge_term);
+                inpL = ggml_add(ctx0, inpL, merge_term);
+                ggml_build_forward_expand(gf, inpL);
+                cb(inpL, "l_in_merged", il);
+            }
+        }
+
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = dsv4_hc_mean(ctx0, inpL);
             cb(res->t_layer_inp[il], "layer_inp", il);
@@ -1273,6 +1330,14 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         cur = build_norm(cur, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
+        // DeepSeek activates in F8/F16 by design; F32 is overkill.
+        // F16 also halves the activation transfer at the hot/cold split.
+        cur = ggml_cast(ctx0, cur, GGML_TYPE_F16);
+        if (getenv("LLAMA_DEBUG_LOG")) {
+            fprintf(stderr, "F16CAST dsv4 layer %d: cur type=%d ne=[%lld,%lld] nbytes=%zu\n",
+                    (int) il, (int) cur->type, (long long) cur->ne[0], (long long) cur->ne[1], ggml_nbytes(cur));
+        }
+
         const auto & layer = model.layers[il];
         ggml_tensor * selected_experts = nullptr;
         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
@@ -1281,6 +1346,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             exp_probs_b = nullptr;
         }
 
+        const llama_graph_moe_hot hot = { layer.ffn_up_exps_hot, layer.ffn_gate_exps_hot, layer.ffn_down_exps_hot, layer.ffn_hot_remap, layer.ffn_hot_flag, layer.ffn_cold_remap, layer.ffn_hot_cold_skip };
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
                 layer.ffn_up_exps,
@@ -1297,7 +1363,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 nullptr,
                 nullptr,
                 nullptr,
-                selected_experts);
+                selected_experts,
+                layer.ffn_up_exps_hot != nullptr ? &hot : nullptr);
         cb(moe_out, "ffn_moe_out", il);
 
         ggml_tensor * ffn_shexp = build_ffn(cur,
@@ -1307,18 +1374,59 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(ffn_shexp, "ffn_shexp", il);
 
-        cur = ggml_add(ctx0, moe_out, ffn_shexp);
-        cb(cur, "ffn_out", il);
+        if (triple_active && il < moe_layers) {
+            // per-layer mode: the moe merge is deferred to the next layer head.
+            // the residual channel carries only the shared-expert base, and the
+            // hot/cold partial sums plus ffn post are mirrored here so the next
+            // graph can rebuild moe*post (hc_post is linear in its first arg).
+            inpL = build_hc_post(ffn_shexp, residual, post, comb, il);
+            inpL = build_cvec(inpL, il);
+            cb(inpL, "l_out_base", il);
+            hot_moe_host[il] = res->get_hot_moe_host();
+            moe_host_vec [il] = res->get_moe_host();
+            {
+                ggml_tensor * p = ggml_dup_tensor(ctx0, post);
+                ggml_format_name(p, "hc_ffn_post_host");
+                ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(p));
+                GGML_ASSERT(buf != nullptr);
+                ggml_backend_tensor_alloc(buf, p, ggml_backend_buffer_get_base(buf));
+                res->add_cold_host_buf(buf);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, post, p));
+                post_host_vec[il] = p;
+            }
+        } else {
+            cur = ggml_add(ctx0, moe_out, ffn_shexp);
+            cb(cur, "ffn_out", il);
+            inpL = build_hc_post(cur, residual, post, comb, il);
+            inpL = build_cvec(inpL, il);
+            cb(inpL, "l_last", il);
+        }
 
-        inpL = build_hc_post(cur, residual, post, comb, il);
-        inpL = build_cvec(inpL, il);
-        cb(inpL, "l_last", il);
+        // write this layer's output into the cross-graph host channel so the
+        // next per-layer graph reads it from host instead of pulling this graph
+        if (triple_active && il < moe_layers && il + 1 < n_layer) {
+            ggml_tensor * b = ggml_dup_tensor(ctx0, inpL);
+            ggml_format_name(b, "layer_in_%d", il + 1);
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(b));
+            GGML_ASSERT(buf != nullptr);
+            ggml_backend_tensor_alloc(buf, b, ggml_backend_buffer_get_base(buf));
+            res->add_cold_host_buf(buf);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, inpL, b));
+            layer_in[il + 1] = b;
+        }
     }
 
     if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
         res->t_layer_inp[n_layer] = dsv4_hc_mean(ctx0, inpL);
         cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);
         ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
+    }
+
+    // the head (hc_head/lm_head projection) always lives in the whole-model
+    // graphs; after the per-layer loop the active targets may still point at
+    // the last layer's graphs (set_layer_graph is only called for split layers)
+    if (triple_active) {
+        set_layer_graph(-1);
     }
 
     ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);

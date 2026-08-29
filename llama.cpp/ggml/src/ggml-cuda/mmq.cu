@@ -83,8 +83,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
 }
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
-    GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const int32_t mask_col) {
+    GGML_ASSERT(        src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
 
@@ -128,7 +129,16 @@ void ggml_cuda_mul_mat_q(
 
     const bool fallback = ne01 % 128 != 0;
 
-    const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
+    // Force the INT8 (q8_1 / DP4A) path for MXFP4/NVFP4 on the CUDA side too:
+    // the activations are F16, so native FP4 (W4A4) does not fully accelerate,
+    // and more importantly the ROCm side cannot do native FP4 at all - it always
+    // converts to q8_1. Keeping both sides on the same INT8 path makes hot-expert
+    // results numerically identical to the cold/baseline ROCm results (no ULP
+    // drift from different FP4 handling). Set GGML_CUDA_FORCE_Q8=1 to override
+    // blackwell_mma_available (e.g. when comparing INT8 vs native-FP4 behavior).
+    static const char * env_force_q8 = getenv("GGML_CUDA_FORCE_Q8");
+    const bool use_native_fp4 = !(env_force_q8 && atoi(env_force_q8))
+        && blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
@@ -171,7 +181,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1};
+            ne1, mask_col};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -188,6 +198,26 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
 
+    // grid trim: launch only the experts with a non-empty compact column range.
+    // every expert block has a fixed weight-load + smem cost, so empty experts
+    // (col_diff == 0, e.g. hot-offloaded slots or unselected experts) waste a
+    // grid slice for no work. build expert_map (compact zt -> expert id) from the
+    // device bounds once per mmid; ~1KB D2H + sync, negligible vs the 10ms kernel.
+    // set n_nonempty in args below (used as grid z by launch_mul_mat_q).
+    std::vector<int32_t> expert_map;
+    int32_t n_nonempty = 0;
+    ggml_cuda_pool_alloc<int32_t> expert_map_dev;
+
+    // MoE hot-expert offload: the mm_ids_helper forward map (write_inverse=false)
+    // only fills [0, compact) rows; slots routed to hot experts (-1) stay as pool
+    // garbage. The non-scatter quantize kernel reads ids[blockIdx.x] for ALL
+    // ne_get_rows slots, so initialize the whole map to 0 - the helper overwrites
+    // the compact prefix with valid forward entries and the tail stays 0, which
+    // makes the quantize kernel read src1 row 0 (harmless: the mmq kernel only
+    // consumes rows [0, expert_bounds[ne02]) via ids_dst). Same contract as the
+    // scatter path, which guards i < 0 explicitly.
+    CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows * sizeof(int32_t), stream));
+
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
@@ -200,6 +230,55 @@ void ggml_cuda_mul_mat_q(
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
             ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
+
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        // GGML_MMQ_NO_TRIM=1 disables grid-z trimming (keeps the fixed 256-expert
+        // grid) for A/B comparison; the map stays empty and expert_map=nullptr,
+        // so the kernel falls back to identity zt and launch keeps ntzw.
+        if (getenv("GGML_MMQ_NO_TRIM") == nullptr) {
+            std::vector<int32_t> bounds(ne02+1);
+            cudaMemcpy(bounds.data(), expert_bounds.get(), (ne02+1)*sizeof(int32_t), cudaMemcpyDeviceToHost);
+            for (int e = 0; e < ne02; ++e) {
+                if (bounds[e+1] - bounds[e] > 0) {
+                    expert_map.push_back(e);
+                }
+            }
+            n_nonempty = (int32_t) expert_map.size();
+            if (n_nonempty > 0) {
+                expert_map_dev.alloc(ctx.pool(), n_nonempty);
+                cudaMemcpyAsync(expert_map_dev.get(), expert_map.data(), n_nonempty*sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+            }
+        }
+
+        if (getenv("GGML_MMQ_WORKLOG")) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::vector<int32_t> bounds(ne02+1);
+            cudaMemcpy(bounds.data(), expert_bounds.get(), (ne02+1)*sizeof(int32_t), cudaMemcpyDeviceToHost);
+            std::vector<int32_t> ids_h(ne_get_rows);
+            cudaMemcpy(ids_h.data(), ids->data, ne_get_rows*sizeof(int32_t), cudaMemcpyDeviceToHost);
+            int neg = 0;
+            for (auto v : ids_h) if (v == -1) neg++;
+            fprintf(stderr, "MMQWORK t=%s slots=%lld compact=%d neg=%d\n",
+                src0->name, (long long) ne_get_rows, bounds[ne02], neg);
+            // per-expert col_diff distribution: is the hot removal spread evenly?
+            int64_t sum_diff = 0, max_diff = 0, n_nonempty = 0, sum_diff_nonempty = 0;
+            for (int e = 0; e < ne02; ++e) {
+                const int d = bounds[e+1] - bounds[e];
+                if (d > 0) { n_nonempty++; sum_diff_nonempty += d; }
+                if (d > max_diff) max_diff = d;
+                sum_diff += d;
+            }
+            fprintf(stderr, "MMQBOUNDS t=%s ne02=%d n_nonempty=%lld sum_diff=%lld avg_nonempty=%lld max_diff=%lld\n",
+                src0->name, (int) ne02, (long long) n_nonempty, (long long) sum_diff,
+                n_nonempty > 0 ? (long long)(sum_diff_nonempty / n_nonempty) : 0, (long long) max_diff);
+            std::vector<int32_t> ids_src1_h(ne_get_rows);
+            cudaMemcpy(ids_src1_h.data(), ids_src1.get(), ne_get_rows*sizeof(int32_t), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "MMQSRC1 t=%s compact=%d tail_at_compact=%d tail_at_compact1=%d tail_at_end=%d\n",
+                src0->name, bounds[ne02],
+                bounds[ne02] < (int) ne_get_rows ? (int) ids_src1_h[bounds[ne02]] : 999,
+                bounds[ne02]+1 < (int) ne_get_rows ? (int) ids_src1_h[bounds[ne02]+1] : 999,
+                ne_get_rows > 0 ? (int) ids_src1_h[ne_get_rows-1] : 999);
+        }
     }
 
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
@@ -232,6 +311,7 @@ void ggml_cuda_mul_mat_q(
         } else if (dedup_bcast) {
             quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
                                     /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
+            CUDA_CHECK(cudaGetLastError());
         } else {
             quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
@@ -245,13 +325,15 @@ void ggml_cuda_mul_mat_q(
     const int64_t s13 = ne12*s12;
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
+    // expert_map is only valid when ids is present and at least one expert is non-empty.
+    const int32_t * expert_map_arg = (ids != nullptr && n_nonempty > 0) ? expert_map_dev.get() : nullptr;
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         src1_scale.ptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12};
+        ne12, mask_col, n_nonempty, expert_map_arg};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }

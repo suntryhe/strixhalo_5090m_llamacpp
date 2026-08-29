@@ -1547,6 +1547,9 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_scale = nullptr;
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
+    // DS4-style activation clamps; 0 disables. gate: [-inf, glu_clamp_gate], x: [-glu_clamp_x, glu_clamp_x]
+    float glu_clamp_gate = 0.0f;
+    float glu_clamp_x    = 0.0f;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1555,6 +1558,8 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
+    float glu_clamp_gate = 0.0f;
+    float glu_clamp_x    = 0.0f;
 };
 
 struct ggml_cuda_kernel_launch_params {

@@ -353,6 +353,9 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    GGML_API void ggml_backend_sched_add_deferred_peer_copy_node(ggml_backend_sched_t sched, struct ggml_tensor * node);
+    GGML_API void ggml_backend_sched_set_deferred_peer_copy_split(ggml_backend_sched_t sched, bool enabled);
+
     //
     // Meta backend
     //

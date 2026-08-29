@@ -44,7 +44,7 @@ static __global__ void mm_ids_helper(
             int iex_used = -1; // The index at which the expert is used, if any.
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
                 const int expert_used = ids[it*si1 + iex];
-                nex_prev += expert_used < expert;
+                nex_prev += expert_used >= 0 && expert_used < expert;
                 if (expert_used == expert) {
                     iex_used = iex;
                 }
@@ -69,27 +69,39 @@ static __global__ void mm_ids_helper(
             const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
                 ids[it*si1 + iex] : INT_MAX;
             const int iex_used = expert_used == expert ? iex : -1;
-            nex_prev += expert_used < expert;
+            nex_prev += expert_used >= 0 && expert_used < expert;
 
-            // Whether the threads at this token position have used the expert:
-            const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
+            // MoE hot-expert offload: a token may map multiple slots to the same expert
+            // (the mask column of a compact tensor). Count every matching slot so each
+            // gets its own compact row. For standard MoE (<= 1 slot per token per expert)
+            // this reduces to the original behavior.
+            const int match = iex_used != -1 ? 1 : 0;
+
+            // Use ballot + popc for intra-group exclusive prefix sum and group match count.
+            // This is more robust than shfl for the segmented layout (neu_padded lanes per token).
+            const uint64_t ballot = __ballot_sync(~0ull, match);
+            const int seg_base = (threadIdx.x / neu_padded) * neu_padded;
+            const uint64_t seg_mask = ((1ull << neu_padded) - 1) << seg_base;
+            const uint64_t low_mask  = ((1ull << (threadIdx.x % neu_padded)) - 1) << seg_base;
+            const int intra_rank = __popcll(ballot & low_mask);
+            const int group_match = __popcll(ballot & seg_mask);
 
             // Do a scan over threads at lower token positions in warp to get the correct index for writing data:
             int it_compact_add_lower = 0;
 #pragma unroll
             for (int offset = neu_padded; offset < warp_size; offset += neu_padded) {
-                const int tmp = __shfl_up_sync(0xFFFFFFFF, it_compact_add_self, offset, warp_size);
+                const int tmp = __shfl_up_sync(0xFFFFFFFF, group_match, offset, warp_size);
                 if (threadIdx.x >= static_cast<unsigned int>(offset)) {
                     it_compact_add_lower += tmp;
                 }
             }
 
             if (iex_used != -1) {
-                store[it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
+                store[it_compact + it_compact_add_lower + intra_rank] = mm_ids_helper_store(it, iex_used);
             }
 
             // The thread with the highest index in the warp always has the sum over the whole warp, use it to increment all threads:
-            it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
+            it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + group_match, warp_size - 1, warp_size);
         }
     }
     nex_prev = warp_reduce_sum<warp_size>(nex_prev);
@@ -104,6 +116,21 @@ static __global__ void mm_ids_helper(
             ids_src1[it*n_expert_used + iex_used] = nex_prev + itc;
         } else {
             ids_src1[nex_prev + itc] = it*sis1 + iex_used % nchannels_y;
+        }
+    }
+
+    // MoE hot-expert offload (cold chain, -1 slots): the write_inverse map only fills
+    // rows for slots that matched an expert. Slots with id == -1 keep pool garbage,
+    // and the quantize scatter later indexes src1_q8_1 with those stale values,
+    // corrupting the quantized y buffer. Mark every -1 slot so scatter can skip it.
+    if (write_inverse) {
+        for (int it = 0; it < n_tokens; ++it) {
+            for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
+                const int expert_used = ids[it*si1 + iex];
+                if (expert_used < 0) {
+                    ids_src1[it*n_expert_used + iex] = -1;
+                }
+            }
         }
     }
 
@@ -134,7 +161,9 @@ static void launch_mm_ids_helper(
 
     const dim3 num_blocks(n_experts, 1, 1);
     const dim3 block_size(warp_size, 1, 1);
-    const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
+    // MoE hot-expert offload: a token may map multiple slots to the same expert
+    // (mask column), so reserve room for the worst case (all slots on one expert).
+    const size_t nbytes_shared = n_tokens*n_expert_used_var*sizeof(mm_ids_helper_store);
     GGML_ASSERT(nbytes_shared <= smpbo);
     mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);

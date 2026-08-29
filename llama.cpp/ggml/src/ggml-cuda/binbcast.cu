@@ -413,7 +413,7 @@ static void ggml_cuda_op_bin_bcast(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
     const void * src0_dd, const void * src1_dd, void * dst_dd, cudaStream_t stream) {
 
-    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_I32);
 
     if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         op()(src0, src1, dst, (const float *)src0_dd, (const float *)src1_dd, (float *)dst_dd, stream);
@@ -423,6 +423,9 @@ static void ggml_cuda_op_bin_bcast(
         op()(src0, src1, dst, (const half *) src0_dd, (const float *)src1_dd, (half *) dst_dd, stream);
     } else if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
         op()(src0, src1, dst, (const half *) src0_dd, (const float *)src1_dd, (float *)dst_dd, stream);
+    } else if (src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32) {
+        // I32 REPEAT (MoE remap tables): op_repeat is a pure copy, safe for indices
+        op()(src0, src1, dst, (const int32_t *) src0_dd, (const int32_t *)src1_dd, (int32_t *) dst_dd, stream);
     } else {
         fprintf(stderr, "%s: unsupported types: dst: %s, src0: %s, src1: %s\n", __func__,
             ggml_type_name(dst->type), ggml_type_name(src0->type), ggml_type_name(src1->type));

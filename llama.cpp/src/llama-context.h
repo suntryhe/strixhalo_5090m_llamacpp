@@ -245,7 +245,7 @@ public:
     llm_graph_result * get_gf_res_reserve() const;
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    ggml_status graph_compute(ggml_cgraph * gf, bool batched, const llama_ubatch * ubatch = nullptr);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -343,6 +343,17 @@ private:
 
     ggml_backend_sched_ptr sched;
 
+    // second scheduler for the cold MoE chain graph (ROCm0); runs in parallel
+    // with the main scheduler (CUDA0) to overlap the hot and cold expert chains
+    ggml_backend_sched_ptr sched_cold;
+
+    // per-layer graph scheduler (GGML_MOE_TRIPLE): A_il / hot_il / cold_il
+    // subgraphs run here so the main sched (whole-model tail) and sched_cold
+    // are never reset after their single process_ubatch allocation. split_graph
+    // rewrites node src to sched-ctx copies; re-splitting the same cgraph after
+    // a fresh ctx leaves those src dangling (UB abort). each cgraph splits once.
+    ggml_backend_sched_ptr sched_layer;
+
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;
@@ -377,6 +388,11 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // per-layer graph A_0 already split+allocated on sched_layer during
+    // process_ubatch (to make attention inputs buffer-backed before set_inputs),
+    // so graph_compute must not reset+resplit it (split_graph rewrites node src)
+    bool moe_prealloc_a0 = false;
 
     // perf
     mutable int64_t t_start_us  = 0;

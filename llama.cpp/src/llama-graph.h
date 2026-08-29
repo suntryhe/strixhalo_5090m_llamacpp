@@ -6,6 +6,7 @@
 #include "llama-adapter.h"
 
 #include <cstdint>
+#include <cstring>
 #include <vector>
 #include <memory>
 #include <set>
@@ -31,6 +32,12 @@ class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
+
+// luz policy gate for the deferred peer-copy MoE join (see llama-graph.cpp):
+// llama-context probes the chain backends once at init and records whether
+// they share a runtime (same vendor = direct peer reads are legal)
+void llama_set_moe_deferred_join_supported(bool v);
+bool llama_moe_deferred_join_supported();
 
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {
@@ -893,7 +900,7 @@ class llm_graph_result {
 public:
     llm_graph_result(int64_t max_nodes);
 
-    virtual ~llm_graph_result() = default;
+    virtual ~llm_graph_result();
 
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
     ggml_tensor * get_logits()      const { return t_logits; }
@@ -904,7 +911,79 @@ public:
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
+    ggml_cgraph  * get_gf_cold() const { return gf_cold; }
+    ggml_cgraph  * get_gf_hot() const { return gf_hot; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
+
+    // per-layer graph storage for the triple-subgraph pipeline (GGML_MOE_TRIPLE):
+    // each layer il has its own attention+norm graph (gf_a), hot chain graph
+    // (gf_hot) and cold chain graph (gf_cold), so graph_compute can submit them
+    // per layer with host-side event gating instead of one whole-model graph.
+    // Only populated when GGML_MOE_TRIPLE is set; defaults stay empty.
+    void set_n_layer(int64_t n) { n_layer = n; }
+    int64_t get_n_layer() const { return n_layer; }
+
+    // reserve-mode marker: graph_reserve builds a whole-model measurement graph
+    // to size the compute buffers once. per-layer split (GGML_MOE_TRIPLE) must
+    // be disabled there - a split measurement graph leaves the whole-model gf
+    // without the first layers and ggml_backend_sched_reserve aborts on it.
+    void set_reserve_mode(bool v) { reserve_mode = v; }
+    bool get_reserve_mode() const { return reserve_mode; }
+    ggml_cgraph * get_gf_a(int64_t il)   const { return (il >= 0 && il < (int64_t) gf_a_vec.size())   ? gf_a_vec[il]   : nullptr; }
+    ggml_cgraph * get_gf_hot_layer(int64_t il) const { return (il >= 0 && il < (int64_t) gf_hot_vec.size()) ? gf_hot_vec[il] : nullptr; }
+    ggml_cgraph * get_gf_cold_layer(int64_t il) const { return (il >= 0 && il < (int64_t) gf_cold_vec.size()) ? gf_cold_vec[il] : nullptr; }
+    std::vector<ggml_cgraph *> gf_a_vec;
+    std::vector<ggml_cgraph *> gf_hot_vec;
+    std::vector<ggml_cgraph *> gf_cold_vec;
+
+    // host(CPU) buffers backing the cold-chain boundary tensors; owned here so
+    // they live as long as the compute ctx and are freed with it
+    std::vector<ggml_backend_buffer_t> cold_host_bufs;
+    void add_cold_host_buf(ggml_backend_buffer_t buf) {
+        // zero-init so a main-graph merge never reads uninitialized host memory
+        // before the cold sched has written it (deterministic validation reads)
+        std::memset(ggml_backend_buffer_get_base(buf), 0, ggml_backend_buffer_get_size(buf));
+        cold_host_bufs.push_back(buf);
+    }
+
+    // host(CPU) buffers backing the hot-chain boundary tensors (hot graph runs
+    // on the main sched, but its inputs are computed by the attention part of
+    // gf; op==NONE host mirrors stop visit_parents recursion into gf, same as
+    // cold_boundary)
+    std::vector<ggml_backend_buffer_t> hot_host_bufs;
+    void add_hot_host_buf(ggml_backend_buffer_t buf) {
+        ggml_backend_buffer_clear(buf, 0);
+        hot_host_bufs.push_back(buf);
+    }
+
+    // last cold-chain host output tensor (cold_moe_out), for readback validation
+    ggml_tensor * t_moe_host = nullptr;
+    ggml_tensor * get_moe_host() const { return t_moe_host; }
+    void set_moe_host(ggml_tensor * t) { t_moe_host = t; }
+
+    // last hot-chain host output tensor (hot_moe_out); the main graph merge reads
+    // this mirror instead of the CUDA0 hot_sum so it never pulls the hot chain in
+    ggml_tensor * t_hot_moe_host = nullptr;
+    ggml_tensor * get_hot_moe_host() const { return t_hot_moe_host; }
+    void set_hot_moe_host(ggml_tensor * t) { t_hot_moe_host = t; }
+
+    // deferred peer-copy nodes registered per layer while building the per-layer
+    // graphs; the scheduler turns the cold (ROCm0) result into an event the CUDA0
+    // join waits on instead of a host mirror + full synchronize (luz shape).
+    // Indexed by layer so per-layer submission registers only its own nodes:
+    // split_graph resolves producer/consumer splits within one submitted graph.
+    std::vector<std::vector<ggml_tensor *>> deferred_peer_copy_nodes_by_layer;
+    void add_deferred_peer_copy_node(int64_t il, ggml_tensor * t) {
+        if ((int64_t) deferred_peer_copy_nodes_by_layer.size() <= il) {
+            deferred_peer_copy_nodes_by_layer.resize(il + 1);
+        }
+        deferred_peer_copy_nodes_by_layer[il].push_back(t);
+    }
+    const std::vector<ggml_tensor *> & get_deferred_peer_copy_nodes(int64_t il) const {
+        static const std::vector<ggml_tensor *> empty;
+        return il >= 0 && il < (int64_t) deferred_peer_copy_nodes_by_layer.size()
+            ? deferred_peer_copy_nodes_by_layer[il] : empty;
+    }
 
     int64_t get_max_nodes() const;
 
@@ -926,6 +1005,19 @@ public:
 
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
 
+    // hot-expert stats: per-layer snapshot tensor holding the selected expert ids
+    // (copied from selected_experts in build_moe_ffn so the data survives compute)
+    struct moe_snap_t {
+        int il;
+        ggml_tensor * snap;
+    };
+
+    void add_moe_snap(int il, ggml_tensor * snap) {
+        moe_snaps.push_back({il, snap});
+    }
+
+    const std::vector<moe_snap_t> & get_moe_snaps() const { return moe_snaps; }
+
     void set_params(const llm_graph_params & params);
 
     // important graph nodes
@@ -945,6 +1037,7 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
+    std::vector<moe_snap_t> moe_snaps;
 
     ggml_context_ptr ctx_compute;
 
@@ -953,7 +1046,19 @@ public:
 
     ggml_cgraph * gf;
 
+    // second graph for the cold MoE chain (ROCm0); shares the same ctx_compute
+    // metadata pool as gf so the two graphs can be built together and submitted
+    // to two independent schedulers (hot CUDA0 / cold ROCm0)
+    ggml_cgraph * gf_cold = nullptr;
+
+    // third graph for the hot MoE chain (CUDA0): built as its own cgraph so the
+    // graph_compute pipeline can gate it against gf_cold with host-side events
+    // instead of the whole-graph handshake/replay (per-layer A_i/hot_i/cold_i)
+    ggml_cgraph * gf_hot = nullptr;
+
     int64_t max_nodes;
+    int64_t n_layer = 0; // set by llama_context before graph build (GGML_MOE_TRIPLE)
+    bool reserve_mode = false; // set by graph_reserve: disable per-layer split during measurement
 
 private:
     // keep a copy of the previous graph parameters
@@ -978,6 +1083,20 @@ struct llm_graph_qkv {
     ggml_tensor * q; // [n_embd_head, n_head,    n_tokens]
     ggml_tensor * k; // [n_embd_head, n_head_kv, n_tokens]
     ggml_tensor * v; // [n_embd_head, n_head_kv, n_tokens]
+};
+
+// MoE hot-expert offload surgery
+// compact per-layer copies of the hot expert columns on the dedicated hot device,
+// plus the remap/flag tables that split the ids and weights between the two branches
+struct llama_graph_moe_hot {
+    ggml_tensor * up_exps   = nullptr; // [n_ff, n_embd, n_hot+1], last column is the all-zero expert
+    ggml_tensor * gate_exps = nullptr; // [n_ff, n_embd, n_hot+1]
+    ggml_tensor * down_exps = nullptr; // [n_embd, n_ff, n_hot+1]
+    ggml_tensor * remap     = nullptr; // [n_expert] I32, global id -> local id (n_hot for cold experts)
+    ggml_tensor * flag      = nullptr; // [n_expert] F32, 1.0f for hot experts, 0.0f for cold
+    ggml_tensor * cold_remap = nullptr; // [n_expert] I32, -1 for hot experts, original id for cold
+
+    bool cold_skip = false; // all experts are hot: build only the hot chain, no cold mmid
 };
 
 struct llm_graph_context {
@@ -1034,6 +1153,34 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+    ggml_cgraph  * gf_cold = nullptr; // cold MoE chain graph (ROCm0), parallel to gf
+    ggml_cgraph  * gf_hot = nullptr;  // hot MoE chain graph (CUDA0), parallel to gf
+
+    // per-layer graph targets for the triple-subgraph pipeline (GGML_MOE_TRIPLE):
+    // the dflash layer loop calls set_layer_graph(il) before building layer il,
+    // so attention+norm nodes expand into that layer's gf_a and the MoE chains
+    // into gf_hot/gf_cold. defaults point at the whole-model graphs.
+    // layer index of the currently active per-layer targets (-1 = whole-model)
+    int layer_cur = -1;
+    void set_layer_graph(int il) {
+        layer_cur = il;
+        if (res != nullptr && il >= 0) {
+            gf      = res->get_gf_a(il);
+            gf_hot  = res->get_gf_hot_layer(il);
+            gf_cold = res->get_gf_cold_layer(il);
+            if (gf == nullptr || gf_hot == nullptr || gf_cold == nullptr) {
+                // out of the triple range (GGML_MOE_TRIPLE_LAYERS): fall back to
+                // the whole-model graphs for the remaining layers
+                gf      = res->get_gf();
+                gf_hot  = res->get_gf_hot();
+                gf_cold = res->get_gf_cold();
+            }
+        } else {
+            gf      = res != nullptr ? res->get_gf()      : nullptr;
+            gf_hot  = res != nullptr ? res->get_gf_hot()  : nullptr;
+            gf_cold = res != nullptr ? res->get_gf_cold() : nullptr;
+        }
+    }
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
@@ -1115,7 +1262,8 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             const llama_graph_moe_hot * hot = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1141,7 +1289,17 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             const llama_graph_moe_hot * hot = nullptr) const;
+
+    // shared by the cold and hot expert chains so both branches apply the exact same activation
+    ggml_tensor * build_moe_act(
+             ggml_tensor * gate,
+             ggml_tensor * up,
+         llm_ffn_op_type   type_op,
+                    bool   has_gate,
+                    bool   clamp_gate,
+                     int   il) const;
 
     //
     // inputs

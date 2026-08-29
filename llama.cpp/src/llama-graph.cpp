@@ -1,5 +1,6 @@
 #include "llama-graph.h"
 
+#include "llama-hotstats.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -23,6 +24,21 @@
 #include <sstream>
 #include <string>
 #include <unordered_set>
+
+// luz policy gate for the deferred peer-copy join: direct GPU-to-GPU reads
+// require both chain backends to share a runtime (same vendor + P2P). When the
+// GPUs are cross-vendor (e.g. CUDA + ROCm) the graph build must fall back to
+// scheduler host staging, so llama-context probes the backends once and
+// records the verdict here for build_moe_ffn.
+static bool g_moe_deferred_join_supported = false;
+
+void llama_set_moe_deferred_join_supported(bool v) {
+    g_moe_deferred_join_supported = v;
+}
+
+bool llama_moe_deferred_join_supported() {
+    return g_moe_deferred_join_supported;
+}
 
 // dedup helpers
 
@@ -502,6 +518,12 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
+    if (getenv("LLAMA_DEBUG_LOG")) {
+        fprintf(stderr, "MOEATTNK-SET k_idxs=%p buf=%s n_tok=%d\n", (void*) self_k_idxs,
+                self_k_idxs && self_k_idxs->buffer ? ggml_backend_buffer_name(self_k_idxs->buffer) : "-",
+                (int) ubatch->n_tokens);
+        fflush(stderr);
+    }
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
@@ -944,6 +966,14 @@ static ggml_tensor * dsv4_build_input_1d(
     ggml_set_input(res);
     ggml_set_name(res, name.c_str());
 
+    // pin the dsv4 index inputs to an owned host buffer: every per-layer graph
+    // shares the same tensor, and galloc would re-place it (or reuse its slot)
+    // after each sched reset; with t->buffer set it skips re-allocation and the
+    // data written by set_input stays valid for all layers.
+    ggml_backend_buffer_t hbuf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(res));
+    GGML_ASSERT(hbuf != nullptr);
+    ggml_backend_tensor_alloc(hbuf, res, ggml_backend_buffer_get_base(hbuf));
+
     return res;
 }
 
@@ -1312,17 +1342,38 @@ llm_graph_result::llm_graph_result(int64_t max_nodes) : max_nodes(max_nodes) {
     debug = LLAMA_GRAPH_RESULT_DEBUG ? atoi(LLAMA_GRAPH_RESULT_DEBUG) : 0;
 }
 
+llm_graph_result::~llm_graph_result() {
+    for (auto & buf : cold_host_bufs) {
+        ggml_backend_buffer_free(buf);
+    }
+}
+
 int64_t llm_graph_result::get_max_nodes() const {
     return max_nodes;
 }
 
 void llm_graph_result::reset() {
+    // release host buffers backing the cold-chain boundaries before the graph
+    // is rebuilt (tensors die with ctx_compute, the buffers are owned here)
+    for (auto & buf : cold_host_bufs) {
+        ggml_backend_buffer_free(buf);
+    }
+    cold_host_bufs.clear();
+
+    for (auto & buf : hot_host_bufs) {
+        ggml_backend_buffer_free(buf);
+    }
+    hot_host_bufs.clear();
+
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+
+    t_moe_host    = nullptr;
+    t_hot_moe_host = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1336,8 +1387,21 @@ void llm_graph_result::reset() {
 
     inputs.clear();
     fused_nodes.clear();
+    moe_snaps.clear();
 
-    buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
+    // reserve metadata space for all graphs (main + optional cold/hot MoE chains
+    // + per-layer graphs in triple mode). each per-layer graph uses a per-layer
+    // node budget, so the total stays proportional to max_nodes.
+    const bool moe_dual = getenv("GGML_MOE_DUAL") != nullptr;
+    const bool moe_triple = getenv("GGML_MOE_TRIPLE") != nullptr;
+    const int n_graphs = 1 + (moe_dual ? 1 : 0) + (moe_triple ? 1 : 0);
+    size_t reserved = n_graphs*(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
+    if (moe_triple && n_layer > 0) {
+        const int64_t max_nodes_layer = max_nodes / n_layer + 64;
+        const size_t per_layer = 3*(ggml_tensor_overhead()*max_nodes_layer + ggml_graph_overhead_custom(max_nodes_layer, false));
+        reserved += n_layer * per_layer;
+    }
+    buf_compute_meta.resize(reserved);
 
     ggml_init_params params = {
         /*.mem_size   =*/ buf_compute_meta.size(),
@@ -1348,6 +1412,39 @@ void llm_graph_result::reset() {
     ctx_compute.reset(ggml_init(params));
 
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
+    // default single-graph mode: the cold chain builds into the main graph (gf)
+    // and ggml's own cross-backend split/copy machinery orders it against the
+    // hot attention chain (a two-graph ordering cannot express the per-layer
+    // interleave: attention[il] -> cur -> cold[il] -> moe_host -> merge[il]).
+    // Set GGML_MOE_DUAL=1 to build the cold chain into a separate graph (gf_cold).
+    // Set GGML_MOE_TRIPLE=1 to also separate the hot chain (gf_hot).
+    gf_cold = moe_dual ? ggml_new_graph_custom(ctx_compute.get(), max_nodes, false) : nullptr;
+    gf_hot  = moe_triple ? ggml_new_graph_custom(ctx_compute.get(), max_nodes, false) : nullptr;
+
+    // per-layer graphs: only in triple mode, and only when the layer count is
+    // known (llama_context calls set_n_layer after model load, before build)
+    gf_a_vec.clear();
+    gf_hot_vec.clear();
+    gf_cold_vec.clear();
+    if (moe_triple && n_layer > 0) {
+        // each per-layer graph needs only the nodes of one layer; use a per-layer
+        // node budget so n_layer graphs fit in the metadata pool
+        const int64_t max_nodes_layer = max_nodes / n_layer + 64;
+        gf_a_vec.resize(n_layer);
+        gf_hot_vec.resize(n_layer);
+        gf_cold_vec.resize(n_layer);
+        for (int64_t il = 0; il < n_layer; ++il) {
+            gf_a_vec[il]    = ggml_new_graph_custom(ctx_compute.get(), max_nodes_layer, false);
+            gf_hot_vec[il]  = ggml_new_graph_custom(ctx_compute.get(), max_nodes_layer, false);
+            // hot+cold chains share one per-layer graph: the layer sched has all
+            // backends (CUDA0/ROCm0/CPU), so its split_graph routes the hot nodes
+            // to CUDA0 and the cold nodes to ROCm0 within a single submission.
+            // (tuned via GGML_MOE_TRIPLE_HC_SAME_GRAPH; default off = legacy dual)
+            const bool hc_same = getenv("GGML_MOE_TRIPLE_HC_SAME_GRAPH") != nullptr;
+            gf_cold_vec[il] = hc_same ? gf_hot_vec[il]
+                                      : ggml_new_graph_custom(ctx_compute.get(), max_nodes_layer, false);
+        }
+    }
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
@@ -1490,7 +1587,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
-    gf               (res->get_gf()) {
+    gf               (res->get_gf()),
+    gf_cold          (res->get_gf_cold()),
+    gf_hot           (res->get_gf_hot()) {
         res->set_params(params);
     }
 
@@ -1913,7 +2012,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         const llama_graph_moe_hot * hot) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1934,7 +2034,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
+        selected_experts_in,
+        hot
     );
 }
 
@@ -1962,7 +2063,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         const llama_graph_moe_hot * hot) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2059,6 +2161,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     cb(selected_experts, "ffn_moe_topk", il);
 
+    ggml_tensor * snap = nullptr;
+    if (llama_hotstats::enabled() || getenv("LLAMA_EXPERT_LRU_SLOTS_PER_LAYER")) {
+        snap = ggml_cpy(ctx0, selected_experts, ggml_dup(ctx0, selected_experts));
+        ggml_build_forward_expand(gf, snap);
+    }
+    res->add_moe_snap(il, snap);
+
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
@@ -2104,6 +2213,148 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
+    // shared mmid input: reused by the hot expert chain below (cur is overwritten by the cold chain)
+    ggml_tensor * cur_moe = cur;
+
+    // MoE hot-expert offload surgery: second mmid chain on the hot device.
+    // Built BEFORE the cold chain so the scheduler submits the hot split first:
+    // hot chain inputs (cur_moe, hot_ids, hot weights) all live on CUDA0, so the
+    // hot split needs no cross-vendor wait and runs on CUDA0 while the cold chain
+    // runs on ROCm0 - the two chains overlap instead of serializing.
+    ggml_tensor * experts_hot = nullptr;
+    ggml_tensor * w_hot  = nullptr;
+    ggml_tensor * w_cold = nullptr;
+    ggml_tensor * hot_ids = nullptr;
+    if (hot != nullptr) {
+        GGML_ASSERT(!weight_before_ffn && "MoE hot expert offload is not supported with weight_before_ffn");
+
+        // when the hot chain is built into its own graph (gf_hot), its inputs
+        // become op==NONE host mirrors of the main-graph tensors (same trick as
+        // cold_boundary): ggml_visit_parents_graph stops recursion at them, so
+        // expanding into gf_hot never pulls the CUDA0 attention chain in
+        ggml_tensor * hot_cur = cur_moe;
+        ggml_tensor * hot_sel = selected_experts;
+        ggml_tensor * hot_w   = weights;
+        if (gf_hot != nullptr) {
+            auto hot_boundary = [&](ggml_tensor * src, const char * nm) -> ggml_tensor * {
+                ggml_tensor * b = ggml_dup_tensor(ctx0, src);
+                ggml_format_name(b, "hot_%s", nm);
+                ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(b));
+                GGML_ASSERT(buf != nullptr);
+                ggml_backend_tensor_alloc(buf, b, ggml_backend_buffer_get_base(buf));
+                res->add_hot_host_buf(buf);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, b));
+                return b;
+            };
+            hot_cur = hot_boundary(cur_moe, "cur");
+            hot_sel = hot_boundary(selected_experts, "sel");
+            hot_w   = hot_boundary(weights, "w");
+        }
+
+        // remap/flag are 1D static tables; get_rows needs [1, n_expert, n_tokens] layout.
+        // For decode n_tokens==1 the reshape alone satisfies get_rows'
+        // a->ne[2] == b->ne[1] assert (ne[2]=1), so repeat_4d is a pure no-op
+        // that materializes a copy every token - skip it on the hot path.
+        ggml_tensor * remap_3d = ggml_reshape_3d(ctx0, hot->remap, 1, hparams.n_expert, 1);
+        if (n_tokens > 1) {
+            remap_3d = ggml_repeat_4d(ctx0, remap_3d, 1, hparams.n_expert, n_tokens, 1);
+        }
+        ggml_tensor * flag_3d = ggml_reshape_3d(ctx0, hot->flag, 1, hparams.n_expert, 1);
+        if (n_tokens > 1) {
+            flag_3d = ggml_repeat_4d(ctx0, flag_3d, 1, hparams.n_expert, n_tokens, 1);
+        }
+
+        // hot chain computes the same n_expert_used slots as the cold chain;
+        // slots routed to non-hot experts map to the mask column and output zero.
+        // ids must match the cold chain's ids layout exactly so both mmid kernels
+        // group experts identically (avoids per-layer ULP drift).
+        ggml_tensor * hot_ids_raw = ggml_get_rows(ctx0, remap_3d, hot_sel);   // [1, n_expert_used, n_tokens]
+        hot_ids = ggml_reshape_2d(ctx0, hot_ids_raw, n_expert_used, n_tokens);
+        cb(hot_ids, "ffn_moe_hot_ids", il);
+
+        // force hot_ids onto the hot device: the remap/flag tables are WEIGHTS
+        // buffers on CUDA0, but get_rows otherwise follows the cold-side
+        // selected_experts backend, causing a cross-vendor ping-pong per layer.
+        // Match the backend by the device of the hot up_exps buffer.
+        if (sched != nullptr && hot->up_exps->buffer != nullptr) {
+            const ggml_backend_dev_t hot_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(hot->up_exps->buffer));
+            if (hot_dev != nullptr) {
+                int matched = 0;
+                for (int bi = 0; bi < ggml_backend_sched_get_n_backends(sched); bi++) {
+                    const ggml_backend_t b = ggml_backend_sched_get_backend(sched, bi);
+                    if (b != nullptr && ggml_backend_get_device(b) == hot_dev) {
+                        ggml_backend_sched_set_tensor_backend(sched, hot_ids_raw, b);
+                        matched = 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        ggml_tensor * hot_up = build_lora_mm_id(hot->up_exps, hot_cur, hot_ids); // [n_ff, n_expert_used, n_tokens]
+        cb(hot_up, "ffn_moe_hot_up", il);
+
+        ggml_tensor * hot_gate = build_lora_mm_id(hot->gate_exps, hot_cur, hot_ids); // [n_ff, n_expert_used, n_tokens]
+        cb(hot_gate, "ffn_moe_hot_gate", il);
+
+        ggml_tensor * hot_act = build_moe_act(hot_gate, hot_up, type_op, true, hot->gate_exps != nullptr, il);
+        cb(hot_act, "ffn_moe_hot_act", il);
+
+        experts_hot = build_lora_mm_id(hot->down_exps, hot_act, hot_ids); // [n_embd, n_expert_used, n_tokens]
+        cb(experts_hot, "ffn_moe_hot_down", il);
+
+        // split the weights: hot slots are computed by the hot chain, cold slots by the cold chain
+        if (hot->cold_skip) {
+            // all experts are hot: the cold chain is not built, so the full expert
+            // weights go to the hot branch and no cold partial must be accumulated
+            w_hot  = gf_hot != nullptr ? hot_w : weights;
+            w_cold = nullptr;
+        } else {
+            ggml_tensor * hot_flag = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, flag_3d, hot_sel), 1, n_expert_used, n_tokens);
+            if (gf_hot != nullptr) {
+                // triple-subgraph mode: the hot chain is a separate graph, so the
+                // hot weights must come from the host mirrors (hot_w/hot_sel) or
+                // visit_parents pulls the CUDA0 softmax/topk chain into gf_hot
+                w_hot  = ggml_mul(ctx0, hot_w, hot_flag);
+                // cold side stays in the main graph: recompute from the original
+                // weights/selected_experts so w_cold never references gf_hot nodes
+                ggml_tensor * flag_main = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, flag_3d, selected_experts), 1, n_expert_used, n_tokens);
+                w_cold = ggml_sub(ctx0, weights, ggml_mul(ctx0, weights, flag_main));
+            } else {
+                w_hot  = ggml_mul(ctx0, weights, hot_flag);
+                w_cold = ggml_sub(ctx0, weights, w_hot);
+            }
+        }
+    }
+
+    // cold chain skips hot slots via cold_ids (-1)
+    ggml_tensor * cold_ids = nullptr;
+    if (hot != nullptr && hot->cold_remap != nullptr) {
+        ggml_tensor * cold_remap_3d = ggml_reshape_3d(ctx0, hot->cold_remap, 1, hparams.n_expert, 1);
+        if (n_tokens > 1) {
+            cold_remap_3d = ggml_repeat_4d(ctx0, cold_remap_3d, 1, hparams.n_expert, n_tokens, 1);
+        }
+        ggml_tensor * cold_ids_raw = ggml_get_rows(ctx0, cold_remap_3d, selected_experts);
+        // keep the get_rows output on CUDA0 (cold_remap table + selected_experts
+        // are both CUDA0); the sched otherwise routes it through a CPU copy.
+        // NOTE: do NOT pin repeat_4d itself - CUDA repeat only accepts
+        // F32/F16 src1 and cold_remap is I32 (assert in ggml_cuda_op_repeat).
+        if (sched != nullptr && hot->cold_remap->buffer != nullptr) {
+            const ggml_backend_dev_t prep_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(hot->cold_remap->buffer));
+            if (prep_dev != nullptr) {
+                for (int bi = 0; bi < ggml_backend_sched_get_n_backends(sched); bi++) {
+                    const ggml_backend_t b = ggml_backend_sched_get_backend(sched, bi);
+                    if (b != nullptr && ggml_backend_get_device(b) == prep_dev) {
+                        ggml_backend_sched_set_tensor_backend(sched, cold_ids_raw, b);
+                        break;
+                    }
+                }
+            }
+        }
+        cold_ids = ggml_reshape_2d(ctx0, cold_ids_raw, n_expert_used, n_tokens);
+        cb(cold_ids, "ffn_moe_cold_ids", il);
+    }
+
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
@@ -2111,12 +2362,92 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
+    const bool cold_skip = hot != nullptr && hot->cold_skip;
+
+    // route the cold chain to the second graph (ROCm0) when the layer expert
+    // weights are not resident on CUDA. cold-graph inputs become op==NONE host
+    // tensors (cold_boundary below): ggml_visit_parents_graph stops recursion
+    // at them, so expanding into gf_cold never pulls CUDA0 attention weights in
+    ggml_cgraph * gf_moe = gf;
+    if (!cold_skip && gf_cold != nullptr && up_exps != nullptr && up_exps->buffer != nullptr) {
+        const ggml_backend_dev_t wdev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(up_exps->buffer));
+        if (wdev != nullptr) {
+            const char * wdev_name = ggml_backend_dev_name(wdev);
+            const bool cold_weights_on_cuda = wdev_name != nullptr && strncmp(wdev_name, "CUDA", 4) == 0;
+            if (!cold_weights_on_cuda) {
+                gf_moe = gf_cold;
+                // host boundary: main graph computes src, copies into a fresh
+                // op==NONE tensor held in the CPU(host) buffer; the cold graph
+                // reads the host memory directly (ROCm UMA zero-copy)
+                auto cold_boundary = [&](ggml_tensor * src, const char * nm) -> ggml_tensor * {
+                    ggml_tensor * b = ggml_dup_tensor(ctx0, src);
+                    ggml_format_name(b, "cold_%s", nm);
+                    // give the tensor an explicit CPU(host) buffer right away:
+                    // ggml_backend_sched_set_tensor_backend only records the pin
+                    // in the MAIN sched's per-sched hash table, the cold sched
+                    // cannot see it and would place the shared tensor in a CUDA0
+                    // buft it cannot handle (GGML_ABORT in split_graph). with an
+                    // allocated CPU buft both scheds map it to their CPU backend.
+                    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(b));
+                    GGML_ASSERT(buf != nullptr);
+                    ggml_backend_tensor_alloc(buf, b, ggml_backend_buffer_get_base(buf));
+                    res->add_cold_host_buf(buf);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, b));
+                    return b;
+                };
+                cur = cold_boundary(cur, "cur");
+                weights = cold_boundary(weights, "w");
+                if (w_cold != nullptr) {
+                    w_cold = cold_boundary(w_cold, "wcold");
+                }
+                if (cold_ids != nullptr) {
+                    cold_ids = cold_boundary(cold_ids, "ids");
+                }
+                selected_experts = cold_boundary(selected_experts, "sel");
+            }
+        }
+    }
+
+    // fused MoE FFN (lucebox moe_fused_kernel): one kernel per chain replaces
+    // the mul_mat_id chains and the per-slot view/add aggregation. decode
+    // only, whole-model single-graph mode, no lora/bias/scale on experts.
+    const bool moe_ffn_fused_base = getenv("GGML_MOE_FUSED_FFN") != nullptr
+        && layer_cur < 0 && n_tokens == 1 && !cold_skip
+        && gf_cold == nullptr && gf_hot == nullptr
+        && gate_up_exps == nullptr && gate_exps != nullptr && up_exps != nullptr && down_exps != nullptr
+        && gate_exps_b == nullptr && up_exps_b == nullptr && down_exps_b == nullptr
+        && gate_exps_s == nullptr && up_exps_s == nullptr && down_exps_s == nullptr
+        && (gate_exps->type == GGML_TYPE_IQ2_XS || gate_exps->type == GGML_TYPE_IQ3_XXS)
+        && (up_exps->type == GGML_TYPE_IQ2_XS || up_exps->type == GGML_TYPE_IQ3_XXS)
+        && (down_exps->type == GGML_TYPE_IQ2_XS || down_exps->type == GGML_TYPE_IQ3_XXS || down_exps->type == GGML_TYPE_IQ4_XS);
+    const bool moe_ffn_fuse_hot = moe_ffn_fused_base
+        && hot != nullptr && experts_hot != nullptr && hot_ids != nullptr && w_hot != nullptr
+        && hot->gate_exps != nullptr && hot->up_exps != nullptr && hot->down_exps != nullptr
+        && hot->gate_exps->type == gate_exps->type
+        && hot->up_exps->type == up_exps->type
+        && hot->down_exps->type == down_exps->type;
+    // layers without a hot table run all-6-slot cold via selected_experts/weights
+    const bool moe_ffn_fuse_cold = moe_ffn_fused_base
+        && (hot != nullptr ? (cold_ids != nullptr && w_cold != nullptr) : true);
+    const bool moe_ffn_fused = moe_ffn_fused_base
+        && (moe_ffn_fuse_hot || moe_ffn_fuse_cold);
+    ggml_tensor * fuse_cold_ids = cold_ids != nullptr ? cold_ids : selected_experts;
+    ggml_tensor * fuse_cold_wts = w_cold != nullptr ? w_cold : weights;
+
+    if (getenv("GGML_MOE_FUSED_DBG") && layer_cur < 0 && il == 2) {
+        fprintf(stderr, "FUSEDBG fused=%d ntok=%d cskip=%d hot=%p ehot=%p wh=%p wc=%p cids=%p gup=%p g=%p u=%p d=%p\n",
+            (int) moe_ffn_fused, n_tokens, (int) cold_skip,
+            (void*) hot, (void*) experts_hot, (void*) w_hot, (void*) w_cold, (void*) cold_ids, (void*) gate_up_exps,
+            (void*) gate_exps, (void*) up_exps, (void*) down_exps);
+    }
+
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
+    if (!cold_skip && !moe_ffn_fused) {
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, cold_ids != nullptr ? cold_ids : selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2135,7 +2466,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, cold_ids != nullptr ? cold_ids : selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2148,7 +2479,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, cold_ids != nullptr ? cold_ids : selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2265,13 +2596,104 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (!weight_before_ffn) {
-        experts = ggml_mul(ctx0, experts, weights);
+        experts = ggml_mul(ctx0, experts, w_cold != nullptr ? w_cold : weights);
         cb(experts, "ffn_moe_weighted", il);
     }
+    } // !cold_skip: the cold chain is removed from the graph when all experts are hot
 
-    ggml_build_forward_expand(gf, experts);
+    if (experts_hot != nullptr && !moe_ffn_fused) {
+        experts_hot = ggml_mul(ctx0, experts_hot, w_hot);
+        cb(experts_hot, "ffn_moe_hot_weighted", il);
+
+        // The hot chain aggregates its (weighted) full-slot output on CUDA0 into
+        // a single [n_embd, n_tokens] partial sum, so only ONE vector crosses the
+        // PCIe bus instead of the full 48MB slot tensor. The cold chain aggregates
+        // on ROCm0 the same way; the two partials are summed on CUDA0 below
+        // (baseline already transfers moe_out ROCm0->CUDA0 every layer, so this
+        // adds no extra cross-vendor traffic).
+        // experts_hot is a contiguous ggml_mul output; the views slice it with
+        // explicit strides, so no ggml_cont copy is needed (same as cold chain).
+        ggml_cgraph * hot_graph = gf_hot != nullptr ? gf_hot : gf;
+        ggml_tensor * hot_experts = experts_hot;
+        ggml_tensor * hot_views[LLAMA_MAX_EXPERTS] = { nullptr };
+        for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
+            hot_views[i] = ggml_view_2d(ctx0, hot_experts, n_embd, n_tokens, hot_experts->nb[2], i*hot_experts->nb[1]);
+            ggml_build_forward_expand(hot_graph, hot_views[i]);
+        }
+        ggml_tensor * hot_sum = hot_views[0];
+        for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
+            hot_sum = ggml_add(ctx0, hot_sum, hot_views[i]);
+            ggml_build_forward_expand(hot_graph, hot_sum);
+        }
+        cb(hot_sum, "ffn_moe_hot_sum", il);
+        // luz single-graph shape (GGML_MOE_TRIPLE_HC_SAME_GRAPH): keep the hot
+        // aggregate in-graph (CUDA0) and join it with the deferred cold result
+        // below, instead of mirroring it to host for the next-layer head merge
+        const bool hc_deferred_join = getenv("GGML_MOE_TRIPLE_HC_SAME_GRAPH") != nullptr
+                                   && getenv("GGML_MOE_TRIPLE_DEFERRED_JOIN") != nullptr
+                                   && llama_moe_deferred_join_supported();
+        if (gf_hot != nullptr && !hc_deferred_join) {
+            // output boundary: the hot aggregate (CUDA0) is copied into a host
+            // op==NONE tensor so the main graph merges it without pulling the hot
+            // chain in (mirror of cold_moe_out)
+            ggml_tensor * hot_host = ggml_dup_tensor(ctx0, hot_sum);
+            ggml_format_name(hot_host, "hot_moe_out");
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(hot_host));
+            GGML_ASSERT(buf != nullptr);
+            ggml_backend_tensor_alloc(buf, hot_host, ggml_backend_buffer_get_base(buf));
+            res->add_hot_host_buf(buf);
+            res->set_hot_moe_host(hot_host);
+            ggml_build_forward_expand(gf_hot, ggml_cpy(ctx0, hot_sum, hot_host));
+            cb(hot_host, "ffn_moe_hot_sum_host", il);
+            experts_hot = hot_host;
+        } else {
+            experts_hot = hot_sum; // [n_embd, n_tokens]
+        }
+    }
 
     ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
+
+    if (cold_skip) {
+        ggml_tensor * moe_out = experts_hot; // [n_embd, n_tokens] already the weighted per-layer sum
+        cb(moe_out, "ffn_moe_hot_merged", il);
+        if (hparams.n_expert_used == 1) {
+            moe_out = ggml_cont(ctx0, moe_out);
+        }
+        cb(moe_out, "ffn_moe_out", il);
+        return moe_out;
+    }
+
+    ggml_tensor * moe_out = nullptr;
+
+    if (moe_ffn_fused) {
+        // op placement: hot fused on CUDA0 (all srcs there); cold fused on
+        // ROCm0 (its expert weights pin it); the add merges on CUDA0.
+        ggml_tensor * fused_input = cur_moe;
+        if (fused_input->type != GGML_TYPE_F32) {
+            fused_input = ggml_cast(ctx0, fused_input, GGML_TYPE_F32);
+        }
+        const float clamp_limit = hparams.swiglu_clamp_exp[il];
+        int np = 0;
+        ggml_tensor * parts[2] = {nullptr, nullptr};
+        if (moe_ffn_fuse_hot) {
+            parts[np] = ggml_moe_fused(ctx0, fused_input, hot->gate_exps, hot->up_exps, hot->down_exps,
+                hot_ids, w_hot, nullptr, nullptr, nullptr, nullptr, n_embd, hot->gate_exps->ne[1], hparams.n_expert_used);
+            ((float *) parts[np]->op_params)[1] = clamp_limit;
+            cb(parts[np], "ffn_moe_fused_hot", il);
+            np++;
+        }
+        if (moe_ffn_fuse_cold) {
+            parts[np] = ggml_moe_fused(ctx0, fused_input, gate_exps, up_exps, down_exps,
+                fuse_cold_ids, fuse_cold_wts, nullptr, nullptr, nullptr, nullptr, n_embd, gate_exps->ne[1], hparams.n_expert_used);
+            ((float *) parts[np]->op_params)[1] = clamp_limit;
+            cb(parts[np], "ffn_moe_fused_cold", il);
+            np++;
+        }
+        moe_out = np == 2 ? ggml_add(ctx0, parts[0], parts[1]) : parts[0];
+        ggml_build_forward_expand(gf, moe_out);
+        cb(moe_out, "ffn_moe_fused_out", il);
+    } else {
+    ggml_build_forward_expand(gf_moe, experts);
 
     assert(n_expert_used > 0);
 
@@ -2279,19 +2701,94 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
         cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
 
-        ggml_build_forward_expand(gf, cur_experts[i]);
+        ggml_build_forward_expand(gf_moe, cur_experts[i]);
     }
 
     // aggregate experts
     // note: here we explicitly use hparams.n_expert_used instead of n_expert_used
     //       to avoid potentially a large number of add nodes during warmup
     //       ref: https://github.com/ggml-org/llama.cpp/pull/14753
-    ggml_tensor * moe_out = cur_experts[0];
+    moe_out = cur_experts[0];
 
     for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
         moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
 
+        ggml_build_forward_expand(gf_moe, moe_out);
+    }
+    }
+
+    if (gf_moe == gf_cold) {
+        // luz single-graph deferred join (GGML_MOE_TRIPLE_HC_SAME_GRAPH +
+        // GGML_MOE_TRIPLE_DEFERRED_JOIN): producer = cold split (ROCm0) records
+        // an event, consumer = the join split below waits on it, so the CUDA0
+        // merge runs as soon as the cold partial lands instead of after a full
+        // host mirror + next-layer synchronize.
+        const bool hc_deferred_join = getenv("GGML_MOE_TRIPLE_HC_SAME_GRAPH") != nullptr
+                                   && getenv("GGML_MOE_TRIPLE_DEFERRED_JOIN") != nullptr
+                                   && llama_moe_deferred_join_supported();
+        if (hc_deferred_join && experts_hot != nullptr) {
+            ggml_set_output(moe_out);
+            ggml_tensor * cold_ready = ggml_ds4_deferred_peer_copy(ctx0, moe_out);
+            ggml_set_input(cold_ready);
+            ggml_set_output(cold_ready);
+            res->add_deferred_peer_copy_node(il, cold_ready);
+            ggml_build_forward_expand(gf_moe, cold_ready);
+            moe_out = ggml_add(ctx0, experts_hot, cold_ready);
+            ggml_build_forward_expand(gf_moe, moe_out);
+            cb(moe_out, "ffn_moe_hc_joined", il);
+            // single merged mirror for the next-layer head merge (hot+cold done)
+            ggml_tensor * merged_host = ggml_dup_tensor(ctx0, moe_out);
+            ggml_format_name(merged_host, "hc_moe_out");
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(merged_host));
+            GGML_ASSERT(buf != nullptr);
+            ggml_backend_tensor_alloc(buf, merged_host, ggml_backend_buffer_get_base(buf));
+            res->add_cold_host_buf(buf);
+            res->set_moe_host(merged_host);
+            ggml_build_forward_expand(gf_moe, ggml_cpy(ctx0, moe_out, merged_host));
+            cb(merged_host, "ffn_moe_hc_merged_host", il);
+            moe_out = merged_host;
+        } else {
+            // output boundary: cold aggregate (ROCm0) copied into a host op==NONE
+            // tensor so the main graph merges it without pulling the cold chain in.
+            // explicit CPU(host) buffer, same reason as cold_boundary: the pin from
+            // the main sched is invisible to the cold sched, an allocated CPU buft
+            // keeps the shared tensor out of a CUDA0 buffer.
+            ggml_tensor * moe_host = ggml_dup_tensor(ctx0, moe_out);
+            ggml_format_name(moe_host, "cold_moe_out");
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(moe_host));
+            GGML_ASSERT(buf != nullptr);
+            ggml_backend_tensor_alloc(buf, moe_host, ggml_backend_buffer_get_base(buf));
+            res->add_cold_host_buf(buf);
+            res->set_moe_host(moe_host);
+            ggml_build_forward_expand(gf_moe, ggml_cpy(ctx0, moe_out, moe_host));
+            cb(moe_host, "ffn_moe_cold_sum_host", il);
+            moe_out = moe_host;
+        }
+    }
+
+    if (experts_hot != nullptr && !moe_ffn_fused && layer_cur < 0) {
+        // whole-model mode: merge the hot chain partial sum (CUDA0) into the
+        // cold chain aggregate here. per-layer mode (layer_cur >= 0) defers the
+        // merge to the head of the next layer graph, which rebuilds it from the
+        // hot_moe_host / moe_host host mirrors written above.
+        moe_out = ggml_add(ctx0, moe_out, experts_hot);
         ggml_build_forward_expand(gf, moe_out);
+        // Force the merge onto the hot device: the cold aggregate crosses the
+        // bus only once as a partial sum ([n_embd, n_tokens]), then the merged
+        // result feeds the next layer's ffn on CUDA0 with no further transfer.
+        if (sched != nullptr && hot != nullptr && hot->up_exps != nullptr && hot->up_exps->buffer != nullptr) {
+            const ggml_backend_dev_t hot_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(hot->up_exps->buffer));
+            if (hot_dev != nullptr) {
+                for (int bi = 0; bi < ggml_backend_sched_get_n_backends(sched); bi++) {
+                    const ggml_backend_t b = ggml_backend_sched_get_backend(sched, bi);
+                    if (b != nullptr && ggml_backend_get_device(b) == hot_dev) {
+                        ggml_backend_sched_set_tensor_backend(sched, moe_out, b);
+                        break;
+                    }
+                }
+            }
+        }
+        cb(moe_out, "ffn_moe_hot_merged", il);
     }
 
     if (hparams.n_expert_used == 1) {
@@ -2302,6 +2799,85 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;
+}
+
+ggml_tensor * llm_graph_context::build_moe_act(
+         ggml_tensor * gate,
+         ggml_tensor * up,
+     llm_ffn_op_type   type_op,
+                bool   has_gate,
+                bool   clamp_gate,
+                 int   il) const {
+    switch (type_op) {
+        case LLM_FFN_SILU:
+            if (clamp_gate) {
+                if (il >= 0) {
+                    const float limit = hparams.swiglu_clamp_exp[il];
+                    constexpr float eps = 1e-6f;
+                    if (limit > eps) {
+                        up = ggml_clamp(ctx0, up, -limit, limit);
+                        cb(up, "ffn_moe_up_clamped", il);
+
+                        if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                            gate = ggml_clamp(ctx0, gate, -INFINITY, limit);
+                            cb(gate, "ffn_moe_gate_clamped", il);
+                            gate = ggml_swiglu_split(ctx0, gate, up);
+                        } else {
+                            ggml_tensor * gate_act = ggml_silu(ctx0, gate);
+                            cb(gate_act, "ffn_moe_silu", il);
+                            gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
+                            cb(gate_act, "ffn_moe_silu_clamped", il);
+                            gate = ggml_mul(ctx0, gate_act, up);
+                        }
+                        cb(gate, "ffn_moe_swiglu_limited", il);
+                        break;
+                    }
+                }
+            }
+
+            if (has_gate) {
+                gate = ggml_swiglu_split(ctx0, gate, up);
+                cb(gate, "ffn_moe_swiglu", il);
+            } else {
+                gate = ggml_silu(ctx0, up);
+                cb(gate, "ffn_moe_silu", il);
+            } break;
+        case LLM_FFN_GELU:
+            if (has_gate) {
+                gate = ggml_geglu_split(ctx0, gate, up);
+                cb(gate, "ffn_moe_geglu", il);
+            } else {
+                gate = ggml_gelu(ctx0, up);
+                cb(gate, "ffn_moe_gelu", il);
+            } break;
+        case LLM_FFN_SWIGLU_OAI_MOE:
+            {
+                constexpr float alpha = 1.702f;
+                constexpr float limit = 7.0f;
+                gate = ggml_swiglu_oai(ctx0, gate, up, alpha, limit);
+                cb(gate, "ffn_moe_swiglu_oai", il);
+            } break;
+        case LLM_FFN_RELU:
+            if (has_gate) {
+                gate = ggml_reglu_split(ctx0, gate, up);
+                cb(gate, "ffn_moe_reglu", il);
+            } else {
+                gate = ggml_relu(ctx0, up);
+                cb(gate, "ffn_moe_relu", il);
+            } break;
+        case LLM_FFN_RELU_SQR:
+            if (has_gate) {
+                GGML_ABORT("fatal error: gated squared relu not implemented");
+            } else {
+                gate = ggml_relu(ctx0, up);
+                gate = ggml_sqr(ctx0, gate);
+                cb(gate, "ffn_moe_relu_sqr", il);
+            } break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+
+    return gate;
 }
 
 // input embeddings with optional lora
@@ -3396,6 +3972,24 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
     inp_raw->self_k_idxs = raw_ctx->build_input_k_idxs(ctx0, ubatch);
     inp_raw->self_kq_mask = dsv4_build_raw_kq_mask(ctx0, raw_ctx, ubatch, cparams, n_stream);
     inp_raw->self_kq_mask_cnv = inp_raw->self_kq_mask;
+
+    inp_raw->self_k_rot = raw_ctx->build_input_k_rot(ctx0);
+    {
+        // the per-layer graphs all share these idxs leaves; galloc re-places them
+        // after every sched reset, so pin them to an owned host buffer to keep the
+        // data set_input writes stable across layers
+        auto bind_host = [&](ggml_tensor * t) {
+            if (t != nullptr && t->buffer == nullptr) {
+                ggml_backend_buffer_t hbuf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(t));
+                GGML_ASSERT(hbuf != nullptr);
+                ggml_backend_tensor_alloc(hbuf, t, ggml_backend_buffer_get_base(hbuf));
+                res->add_cold_host_buf(hbuf);
+            }
+        };
+        bind_host(inp_raw->self_k_idxs);
+        bind_host(inp_raw->self_kq_mask);
+        bind_host(inp_raw->self_k_rot);
+    }
 
     inp_raw->self_k_rot = raw_ctx->build_input_k_rot(ctx0);
     auto inp = std::make_unique<llm_graph_input_dsv4>(cparams, std::move(inp_raw), mctx_cur);

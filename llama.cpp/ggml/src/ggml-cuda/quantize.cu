@@ -1,5 +1,6 @@
 #include "quantize.cuh"
 #include <cstdint>
+#include <type_traits>
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
 // this maps to 256-bit loads in PTX on supported devices,
@@ -50,13 +51,14 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
 #endif // CUDART_VERSION >= 12080
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
+template <typename SRC_T>
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
-        const float * x_ptr, void * vy_ptr,
+        const SRC_T * x_ptr, void * vy_ptr,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const uint32_t ne1, const uint3 ne2) {
     ggml_cuda_pdl_lc();
-    const float * GGML_CUDA_RESTRICT x  = x_ptr;
+    const SRC_T * GGML_CUDA_RESTRICT x  = x_ptr;
     void        * GGML_CUDA_RESTRICT vy = vy_ptr;
     const int64_t i0 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
 
@@ -81,7 +83,14 @@ static __global__ void quantize_q8_1(
     const int64_t iqs = i_cont % QK8_1; // quant index
 
     ggml_cuda_pdl_sync();
-    const float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
+    float xi = 0.0f;
+    if (i0 < ne00) {
+        if constexpr (std::is_same_v<SRC_T, float>) {
+            xi = x[i03*s03 + i02*s02 + i01*s01 + i00];
+        } else {
+            xi = __half2float(x[i03*s03 + i02*s02 + i01*s01 + i00]);
+        }
+    }
     float amax = fabsf(xi);
     float sum = xi;
 
@@ -140,7 +149,10 @@ static __global__ void quantize_mmq_nvfp4(
         const int64_t i2  = blockIdx.y % ne2;
         const int64_t i3  = blockIdx.y / ne2;
         const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
-        base_idx = i3 * s03 + i2 * s02 + i01 * s01;
+        if (i01 < 0) { // MoE hot-expert offload: -1 slots skipped by the cold chain
+            return;
+        }
+        base_idx = i3*s03 + i2*s02 + i01*s01;
     }
     const float * __restrict__  x_row = x + base_idx;
 
@@ -184,6 +196,9 @@ static __global__ void quantize_mmq_nvfp4(
 #pragma unroll
                 for (int slot = 0; slot < n_expert_used; ++slot) {
                     const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            if (i < 0) { // MoE hot-expert offload: -1 slots are skipped by the cold chain
+                continue;
+            }
                     scale[i] = warp_amax[0];
                 }
             } else {
@@ -310,6 +325,9 @@ static __global__ void quantize_mmq_nvfp4(
 #pragma unroll
             for (int slot = 0; slot < n_expert_used; ++slot) {
                 const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            if (i < 0) { // MoE hot-expert offload: -1 slots are skipped by the cold chain
+                continue;
+            }
                 block_fp4_mmq * yb = y + (k_block * ne1 + i);
                 uint32_t * yqs = reinterpret_cast<uint32_t *>(yb->qs);
                 yqs[2 * sub + 0] = q0;
@@ -376,6 +394,9 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
         const int64_t i2  = blockIdx.z % ne2;
         const int64_t i3  = blockIdx.z / ne2;
         const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
+        if (i01 < 0) { // MoE hot-expert offload: -1 slots skipped by the cold chain
+            return;
+        }
         base_pos = i3 * s03 + i2 * s02 + i01 * s01;
     }
 
@@ -428,6 +449,9 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 #pragma unroll
         for (int slot = 0; slot < n_expert_used; ++slot) {
             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            if (i < 0) { // MoE hot-expert offload: -1 slots are skipped by the cold chain
+                continue;
+            }
             block_fp4_mmq * yb = y + (k_block * ne1 + i);
             char2 * yqs2 = (char2 *) yb->qs;
             if (lane_in_group == 0) {
@@ -479,6 +503,9 @@ static __global__ void quantize_mmq_q8_1(
         const int64_t i2  = blockIdx.z % ne2;
         const int64_t i3  = blockIdx.z / ne2;
         const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
+        if (i01 < 0) { // MoE hot-expert offload: -1 slots skipped by the cold chain
+            return;
+        }
         base_idx = i3*s03 + i2*s02 + i01*s01;
     }
 
@@ -527,6 +554,9 @@ static __global__ void quantize_mmq_q8_1(
         int64_t ib;
         if constexpr (scatter) {
             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            if (i < 0) { // MoE hot-expert offload: -1 slots are skipped by the cold chain
+                continue;
+            }
             ib = k_block*ne1 + i;
         } else {
             const int64_t ib0 = blockIdx.z*((int64_t)gridDim.x*gridDim.y*blockDim.x/QK8_1); // first block of channel
@@ -556,7 +586,7 @@ static __global__ void quantize_mmq_q8_1(
 }
 
 void quantize_row_q8_1_cuda(
-        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const void * x, const int32_t * ids, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
     GGML_ASSERT(!ids);
@@ -568,8 +598,11 @@ void quantize_row_q8_1_cuda(
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
-    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
-    GGML_UNUSED(type_src0);
+    if (type_src0 == GGML_TYPE_F16) {
+        ggml_cuda_kernel_launch(quantize_q8_1<__half>, launch_params, (const __half *) x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    } else {
+        ggml_cuda_kernel_launch(quantize_q8_1<float>, launch_params, (const float *) x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    }
 }
 
 void quantize_mmq_q8_1_cuda(

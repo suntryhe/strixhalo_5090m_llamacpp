@@ -9,6 +9,7 @@
 #include "llama-model-loader.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
+#include "llama-expert-lru.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"

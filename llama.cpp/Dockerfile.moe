@@ -1,0 +1,41 @@
+# llamacpp-moe 双后端镜像 (埋点分析用)
+# 基于 prod-7.2.4-dual 基线 (自带 clang/nvcc/hipcc + 全依赖, 无需重装RN)
+# 只编译埋点版 llama-server, 宿主零污染, 用完 podman rm 即弃
+
+FROM localhost/llamacpp:prod-7.2.4-dual
+
+# 复制埋点源码
+COPY . /src-moe/
+
+# 双后端编译 (与生产基线同 flags: CUDA 120 + gfx1151)
+RUN cd /src-moe \
+  && git submodule update --recursive || true \
+  && rm -rf build \
+  && cmake -B build \
+    -DCMAKE_C_COMPILER=clang \
+    -DCMAKE_CXX_COMPILER=clang++ \
+    -DCMAKE_EXE_LINKER=lld \
+    -DCMAKE_MODULE_LINKER=lld \
+    -DCMAKE_SHARED_LINKER=lld \
+    -DGGML_CUDA=ON \
+    -DGGML_HIP=ON \
+    -DGGML_BACKEND_DL=ON \
+    -DGGML_NATIVE=OFF \
+    -DGGML_RPC=ON \
+    -DGGML_CUDA_NO_PEER_COPY=ON \
+    -DCMAKE_CUDA_ARCHITECTURES=120 \
+    -DAMDGPU_TARGETS=gfx1151 \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DROCM_PATH=/opt/rocm \
+    -DHIP_PATH=/opt/rocm \
+    -DHIP_PLATFORM=amd \
+    -DLLAMA_BUILD_TESTS=OFF \
+  && cmake --build build --config Release --target llama-server -j$(nproc) \
+  && cp -f build/bin/llama-server /usr/local/bin/llama-server \
+  && (find build -type f -name 'libllama*.so*' -exec cp -f {} /usr/local/lib64/ \; || true) \
+  && ldconfig \
+  && rm -rf /src-moe/build \
+  && echo "moe hotstats build done"
+
+WORKDIR /app
+CMD ["llama-server", "--host", "0.0.0.0", "--port", "8082", "--ctx-size", "4096", "--n-gpu-layers", "all"]

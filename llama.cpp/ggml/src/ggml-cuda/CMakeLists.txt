@@ -133,6 +133,7 @@ if (CUDAToolkit_FOUND)
 
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
+        add_compile_definitions(USE_CUDA_GRAPH)
     endif()
 
     if (GGML_CUDA_FORCE_MMQ)
