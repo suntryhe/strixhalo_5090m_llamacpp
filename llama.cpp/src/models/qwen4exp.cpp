@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
+#include <cstring>
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     // NextN/MTP: an extra decoder block appended past the trunk. Read this first, since
@@ -958,6 +960,49 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // decode (one token per stream): gather the top-k KV rows per stream and
+    // attend unmasked over the gathered set - bounds attention reads to the
+    // indexer-selected entries instead of streaming the full n_kv under a mask.
+    static const bool qsa_gather = getenv("GGML_QSA_GATHER") == nullptr ||
+                                   strcmp(getenv("GGML_QSA_GATHER"), "0") != 0;
+    if (n_tokens == 1 && qsa_gather) {
+        const int64_t n_embd_head = hparams.n_embd_head_v();
+        const int64_t width   = top_k->ne[0];
+        const int64_t n_strm  = top_k->ne[3];
+        ggml_tensor * gathered = nullptr;
+        for (int64_t s = 0; s < n_strm; s++) {
+            ggml_tensor * q_s = ggml_view_3d(ctx0, q_cur, q_cur->ne[0], q_cur->ne[1], 1,
+                    q_cur->nb[1], q_cur->nb[2], s * q_cur->nb[2]);
+            ggml_tensor * k_s = ggml_view_2d(ctx0, k, k->ne[0]*k->ne[1], k->ne[2],
+                    k->nb[2], s * k->nb[3]);
+            ggml_tensor * v_s = ggml_view_2d(ctx0, v, v->ne[0]*v->ne[1], v->ne[2],
+                    v->nb[2], s * v->nb[3]);
+            ggml_tensor * idx_s = ggml_view_1d(ctx0, top_k, width, s * top_k->nb[3]);
+
+            ggml_tensor * kg = ggml_get_rows(ctx0, k_s, idx_s);
+            kg = ggml_reshape_3d(ctx0, kg, n_embd_head, n_head_kv, width);
+
+            ggml_tensor * vg = ggml_get_rows(ctx0, v_s, idx_s);
+            vg = ggml_reshape_3d(ctx0, vg, n_embd_head, n_head_kv, width);
+
+            ggml_tensor * out_s = build_attn_mha(q_s, kg, vg,
+                    nullptr, nullptr, nullptr, nullptr, kq_scale, il);
+            out_s = ggml_view_2d(ctx0, out_s, out_s->ne[0]*out_s->ne[1], 1, out_s->nb[1], 0);
+
+            gathered = gathered ? ggml_concat(ctx0, gathered, out_s, 1) : out_s;
+        }
+
+        ggml_tensor * cur = ggml_reshape_2d(ctx0, gathered, gathered->ne[0], gathered->ne[1]);
+        cb(cur, "kqv_out", il);
+
+        // the rotation is its own inverse, so undo it on the value side of the output
+        if (inp->self_v_rot) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+        }
+
+        return cur;
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
     cb(cur, "kqv_out", il);
 
@@ -981,6 +1026,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
     const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
+    static bool qsa_dbg_done = false;
+    if (!qsa_dbg_done && getenv("QSA_DEBUG")) {
+        qsa_dbg_done = true;
+        LLAMA_LOG("QSA-DBG: il=%d qsa=%d get_idx_nonnull=%d ratio=%lld n_idx_kv=%d\n",
+                (int) il, (int) qsa, mctx_hyb->get_idx() != nullptr ? 1 : 0,
+                (long long) hparams.dsv4_compress_ratios[il],
+                mctx_hyb->get_idx() ? (int) mctx_hyb->get_idx()->get_n_kv() : -1);
+    }
 
     ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
 
