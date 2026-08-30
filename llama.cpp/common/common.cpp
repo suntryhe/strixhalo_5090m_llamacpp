@@ -1395,6 +1395,50 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    // mmq per-model tuning: mmq_settings.json in the model directory
+    {
+        const auto slash = params.model.path.find_last_of('/');
+        const std::string mmq_path = params.model.path.substr(0, slash + 1) + "mmq_settings.json";
+        std::ifstream mmq_file(mmq_path);
+        if (mmq_file.is_open()) {
+            std::string content((std::istreambuf_iterator<char>(mmq_file)), std::istreambuf_iterator<char>());
+            auto read_int = [&](const char * key) -> int {
+                auto kpos = content.find(key);
+                if (kpos == std::string::npos) return -1;
+                auto cpos = content.find(':', kpos);
+                if (cpos == std::string::npos) return -1;
+                return atoi(content.c_str() + cpos + 1);
+            };
+            int mmq_j = read_int("max_j_occ2");
+            if (mmq_j > 0) {
+                setenv("GGML_MMQ_MAX_J_OCC2", std::to_string(mmq_j).c_str(), 1);
+                LOG_INF("%s: mmq_settings max_j_occ2 = %d\n", __func__, mmq_j);
+            }
+            int mmq_ub = read_int("ubatch");
+            if (mmq_ub > 0 && mmq_ub < (int) cparams.n_ubatch) {
+                LOG_INF("%s: mmq_settings ubatch %d -> %d\n", __func__, (int) cparams.n_ubatch, mmq_ub);
+                cparams.n_ubatch = mmq_ub;
+            }
+            auto read_str = [&](const char * key) -> std::string {
+                auto kpos = content.find(key);
+                if (kpos == std::string::npos) return "";
+                auto cpos = content.find(':', kpos);
+                if (cpos == std::string::npos) return "";
+                auto q1 = content.find('"', cpos);
+                if (q1 == std::string::npos) return "";
+                auto q2 = content.find('"', q1 + 1);
+                if (q2 == std::string::npos) return "";
+                return content.substr(q1 + 1, q2 - q1 - 1);
+            };
+            std::string ids_smem = read_str("ids_helper_smem");
+            if (!ids_smem.empty()) {
+                setenv("GGML_IDS_HELPER_SMEM", ids_smem.c_str(), 1);
+                LOG_INF("%s: mmq_settings ids_helper_smem = %s\n", __func__, ids_smem.c_str());
+            }
+            LOG_INF("%s: mmq_settings loaded from %s\n", __func__, mmq_path.c_str());
+        }
+    }
+
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
