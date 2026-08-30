@@ -173,14 +173,12 @@ static void launch_mm_ids_helper(
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
 }
 
-void ggml_cuda_launch_mm_ids_helper(
+static void launch_mm_ids_helper_legacy(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, const bool has_mask, cudaStream_t stream) {
-    // GGML_IDS_HELPER_SMEM: auto (default) sizes the staging buffer by the actual
-    // per-expert worst case; "full" forces the legacy n_tokens*n_expert_used buffer.
-    const char * env_smem = getenv("GGML_IDS_HELPER_SMEM");
-    const bool force_full = env_smem != nullptr && env_smem[0] == 'f';
-    const bool mask_eff = has_mask && !force_full;
+    // Reached only via GGML_IDS_HELPER_SMEM=full; keep worst-case sizing when a
+    // mask column can pile duplicate slots onto one expert.
+    const bool mask_eff = has_mask;
 
     switch (n_expert_used) {
         case  2:
@@ -205,4 +203,85 @@ void ggml_cuda_launch_mm_ids_helper(
             launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, mask_eff, stream);
             break;
     }
+}
+
+// Counting-sort pipeline: histogram -> exclusive scan -> scatter. Two linear
+// passes over the slot table instead of one rescan per expert (n_experts x
+// table work). Row order inside an expert slice follows atomic arrival order;
+// each output element is an order-independent dot product, so results match
+// the legacy kernel. The scan reuses hist as the scatter cursor.
+
+static __global__ void mm_ids_hist(
+        const int32_t * __restrict__ ids, int * __restrict__ hist,
+        const int ne_get_rows, const int n_expert_used, const int si1) {
+    for (int i = blockIdx.x*blockDim.x + threadIdx.x; i < ne_get_rows; i += gridDim.x*blockDim.x) {
+        const int e = ids[(i / n_expert_used)*si1 + (i % n_expert_used)];
+        if (e >= 0) {
+            atomicAdd(hist + e, 1);
+        }
+    }
+}
+
+static __global__ void mm_ids_scan(
+        int * __restrict__ hist, int * __restrict__ starts, int32_t * __restrict__ expert_bounds, const int n_experts) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+    int acc = 0;
+    for (int e = 0; e < n_experts; ++e) {
+        starts[e] = acc;
+        expert_bounds[e] = acc;
+        acc += hist[e];
+        hist[e] = 0;
+    }
+    expert_bounds[n_experts] = acc;
+}
+
+static __global__ void mm_ids_scatter(
+        const int32_t * __restrict__ ids, int * __restrict__ cursor, const int * __restrict__ starts,
+        int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
+        const int ne_get_rows, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
+    for (int i = blockIdx.x*blockDim.x + threadIdx.x; i < ne_get_rows; i += gridDim.x*blockDim.x) {
+        const int it  = i / n_expert_used;
+        const int iex = i % n_expert_used;
+        const int e   = ids[it*si1 + iex];
+        if (e < 0) {
+            if (write_inverse) {
+                ids_src1[i] = -1;
+            }
+            continue;
+        }
+        const int pos = starts[e] + atomicAdd(cursor + e, 1);
+        ids_dst[pos] = i;
+        if (write_inverse) {
+            ids_src1[i] = pos;
+        } else {
+            ids_src1[pos] = it*sis1 + iex % nchannels_y;
+        }
+    }
+}
+
+void ggml_cuda_launch_mm_ids_helper(
+        const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds,
+        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, const bool has_mask, ggml_cuda_pool & pool, cudaStream_t stream) {
+    // GGML_IDS_HELPER_SMEM=full falls back to the legacy per-expert rescan kernel.
+    const char * env_smem = getenv("GGML_IDS_HELPER_SMEM");
+    if (env_smem != nullptr && env_smem[0] == 'f') {
+        launch_mm_ids_helper_legacy(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, has_mask, stream);
+        return;
+    }
+
+    const int ne_get_rows = n_tokens*n_expert_used;
+    ggml_cuda_pool_alloc<int32_t> hist(pool, n_experts);
+    ggml_cuda_pool_alloc<int32_t> starts(pool, n_experts);
+    CUDA_CHECK(cudaMemsetAsync(hist.get(), 0, n_experts*sizeof(int32_t), stream));
+
+    int blocks = (ne_get_rows + 255) / 256;
+    if (blocks > 2048) {
+        blocks = 2048;
+    }
+    mm_ids_hist<<<blocks, 256, 0, stream>>>(ids, hist.get(), ne_get_rows, n_expert_used, si1);
+    mm_ids_scan<<<1, 32, 0, stream>>>(hist.get(), starts.get(), expert_bounds, n_experts);
+    mm_ids_scatter<<<blocks, 256, 0, stream>>>(ids, hist.get(), starts.get(), ids_src1, ids_dst,
+        ne_get_rows, n_expert_used, nchannels_y, si1, sis1, write_inverse);
 }
