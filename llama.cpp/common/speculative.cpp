@@ -2571,6 +2571,10 @@ common_speculative_init_result::common_speculative_init_result(
 
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
+    // MTP draft steps touch at most a few tokens; reserving full-batch compute
+    // buffers doubles the CUDA footprint for no benefit.
+    cparams.n_batch  = cparams.n_batch  > 1024 ? 1024 : cparams.n_batch;
+    cparams.n_ubatch = cparams.n_ubatch > 1024 ? 1024 : cparams.n_ubatch;
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?

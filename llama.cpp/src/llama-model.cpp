@@ -1892,6 +1892,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             fprintf(stderr, "MOEHOT skip hash-routed layer %d (hash_layer_count=%u)\n", cfg->il, hparams.dsv4_hash_layer_count);
             continue;
         }
+        if (hparams.n_layer_nextn > 0) {
+            continue; // detached MTP draft head: no trunk exps tensors, hot offload is target-only
+        }
         llama_layer & layer = layers[cfg->il];
         n_hot_layers++;
 
@@ -2698,7 +2701,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_BAILINGMOE3);
+                     arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_QWEN4EXP);
 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
