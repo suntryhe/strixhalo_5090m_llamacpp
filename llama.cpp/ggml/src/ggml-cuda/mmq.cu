@@ -231,22 +231,32 @@ void ggml_cuda_mul_mat_q(
             ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
 
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        // GGML_MMQ_NO_TRIM=1 disables grid-z trimming (keeps the fixed 256-expert
-        // grid) for A/B comparison; the map stays empty and expert_map=nullptr,
-        // so the kernel falls back to identity zt and launch keeps ntzw.
-        if (getenv("GGML_MMQ_NO_TRIM") == nullptr) {
-            std::vector<int32_t> bounds(ne02+1);
-            cudaMemcpy(bounds.data(), expert_bounds.get(), (ne02+1)*sizeof(int32_t), cudaMemcpyDeviceToHost);
-            for (int e = 0; e < ne02; ++e) {
-                if (bounds[e+1] - bounds[e] > 0) {
-                    expert_map.push_back(e);
+        // grid-z trimming reads expert_bounds on the host (stream sync + D2H),
+        // which is illegal while the stream is capturing a CUDA graph. When
+        // capturing, skip the trim: expert_map stays empty and the kernel
+        // falls back to identity zt (documented below).
+        cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(stream, &cap_status);
+        const bool trimming_allowed = cap_status != cudaStreamCaptureStatusActive;
+
+        if (trimming_allowed) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            // GGML_MMQ_NO_TRIM=1 disables grid-z trimming (keeps the fixed 512-expert
+            // grid) for A/B comparison; the map stays empty and expert_map=nullptr,
+            // so the kernel falls back to identity zt and launch keeps ntzw.
+            if (getenv("GGML_MMQ_NO_TRIM") == nullptr) {
+                std::vector<int32_t> bounds(ne02+1);
+                cudaMemcpy(bounds.data(), expert_bounds.get(), (ne02+1)*sizeof(int32_t), cudaMemcpyDeviceToHost);
+                for (int e = 0; e < ne02; ++e) {
+                    if (bounds[e+1] - bounds[e] > 0) {
+                        expert_map.push_back(e);
+                    }
                 }
-            }
-            n_nonempty = (int32_t) expert_map.size();
-            if (n_nonempty > 0) {
-                expert_map_dev.alloc(ctx.pool(), n_nonempty);
-                cudaMemcpyAsync(expert_map_dev.get(), expert_map.data(), n_nonempty*sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+                n_nonempty = (int32_t) expert_map.size();
+                if (n_nonempty > 0) {
+                    expert_map_dev.alloc(ctx.pool(), n_nonempty);
+                    cudaMemcpyAsync(expert_map_dev.get(), expert_map.data(), n_nonempty*sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+                }
             }
         }
 
