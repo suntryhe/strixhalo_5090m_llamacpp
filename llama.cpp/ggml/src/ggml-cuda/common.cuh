@@ -1259,7 +1259,11 @@ struct ggml_cuda_graph {
         // HIP/ROCm backend: independent control so CUDA graphs stay enabled on NVIDIA.
         // ROCm wants graphs disabled for prefill (existing test: +~10% prefill), but the
         // same disable knob must not turn off CUDA graph capture on the discrete NVIDIA card.
-        static const bool disable_rocm_graphs_due_to_env = (getenv("GGML_HIP_DISABLE_GRAPHS") != nullptr);
+        // value-based: "1"/"true"/bare presence disables ROCm graphs; "0"/"false"
+        // keeps them enabled so decode can be A/B'd independently of prefill
+        const char * hip_dis = getenv("GGML_HIP_DISABLE_GRAPHS");
+        static const bool disable_rocm_graphs_due_to_env =
+            hip_dis != nullptr && hip_dis[0] != '\0' && hip_dis[0] != '0' && hip_dis[0] != 'f';
         return !(disable_due_to_gpu_arch || disable_rocm_graphs_due_to_env);
 #else
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
