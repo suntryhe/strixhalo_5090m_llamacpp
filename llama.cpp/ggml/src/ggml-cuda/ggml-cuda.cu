@@ -891,6 +891,19 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+#if defined(GGML_USE_HIP)
+// UMA/APU: managed and pool allocations live in system RAM and are host-addressable,
+// so cross-backend copies land directly in the buffer pointer with a single PCIe leg
+// instead of a staging D2H plus H2D pair (ggml_backend_tensor_copy "dst is host" path).
+static bool ggml_backend_cuda_buffer_type_is_host(ggml_backend_buffer_type_t) {
+    if (!ggml_cuda_unified_memory_enabled()) {
+        return false;
+    }
+    const char * mem_mode = getenv("GGML_HIP_MEM_MODE");
+    return !(mem_mode != nullptr && mem_mode[0] == 'p'); // "pool" forces hipMalloc backing
+}
+#endif
+
 static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
     /* .free_buffer     = */ ggml_backend_cuda_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_cuda_buffer_get_base,
@@ -970,7 +983,11 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface 
     /* .get_alignment    = */ ggml_backend_cuda_buffer_type_get_alignment,
     /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
     /* .get_alloc_size   = */ ggml_backend_cuda_buffer_type_get_alloc_size,
+#if defined(GGML_USE_HIP)
+    /* .is_host          = */ ggml_backend_cuda_buffer_type_is_host,
+#else
     /* .is_host          = */ NULL,
+#endif
 };
 
 ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
