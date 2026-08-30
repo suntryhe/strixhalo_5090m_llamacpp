@@ -2586,7 +2586,22 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
-        llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        // pin the draft to the first device: the proportional device split of a
+        // split-target run otherwise parks the head on slow unified memory, and
+        // every draft forward then pays the bandwidth gap
+        ggml_backend_dev_t * dft_dev_ptr = params.devices.data();
+        std::vector<ggml_backend_dev_t> dft_devices;
+        if (params.devices.size() >= 2 && params.devices.back() == nullptr) {
+            dft_devices.push_back(params.devices[0]);
+            dft_devices.push_back(nullptr);
+            dft_dev_ptr = dft_devices.data();
+        }
+        mparams.devices = dft_dev_ptr;
+        llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
+        if (model_dft == NULL && !dft_devices.empty()) {
+            mparams.devices = params.devices.data();
+            model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
+        }
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
             return;
