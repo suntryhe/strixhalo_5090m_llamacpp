@@ -1623,6 +1623,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         const auto & snaps = res->get_moe_snaps();
+        // LRU harvest throttle: each per-layer device->host ids read pays a fixed
+        // sync latency (~50us x ~96 reads/token). Sampling 1-in-N tokens keeps the
+        // sliding-window statistics stable while cutting most of that latency.
+        // "1" restores the old every-token harvest. Prefill keeps full harvest.
+        const int harvest_every = getenv("LLAMA_EXPERT_LRU_HARVEST_EVERY") ? std::atoi(getenv("LLAMA_EXPERT_LRU_HARVEST_EVERY")) : 32;
+        const bool lru_harvest = is_prefill || (decode_count % harvest_every == 0);
         if (lru_dbg_once) {
             lru_dbg_once = false;
             fprintf(stderr, "EXPERTLRU-DBG snaps=%zu first_snap=%p K=%d apply_every=%d prefill=%d\n",
@@ -1636,7 +1642,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             const int n_used = ids->ne[0];
             const int n_tok  = ids->ne[1];
             const int64_t nelem = (int64_t) n_used * n_tok;
-            if (nelem <= 0) {
+            if (nelem <= 0 || !lru_harvest) {
                 continue;
             }
             if (is_prefill) {
