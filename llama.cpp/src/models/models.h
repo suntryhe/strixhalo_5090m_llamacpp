@@ -2278,7 +2278,6 @@ struct llama_model_qwen35 : public llama_model_base {
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
-    class llm_graph_input_qsa;
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
@@ -2325,16 +2324,28 @@ struct llama_model_qwen4exp : public llama_model_base {
                           float   kq_scale,
                             int   il);
 
-        // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
-        // so the layers sharing a ratio share one input set
-        std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
+        // [TAG_QSA_GATHER] gathered decode attention
+        int64_t qsa_gather_n_sel(int64_t n_kv, int64_t width) const;
+
+        ggml_tensor * build_attn_qsa_gather(
+                ggml_tensor * k,
+                ggml_tensor * v,
+                ggml_tensor * kq_mask,
+                ggml_tensor * q_cur,
+                ggml_tensor * top_k,
+                int64_t       width,
+                float         kq_scale,
+                int           il);
+
+        // the QSA block tables and bias depend only on the cells and the ubatch, not the
+        // layer, so every QSA layer shares one input (and one host-side fill per batch)
+        void * qsa_shared = nullptr;
 
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
         ggml_tensor * build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
-                    ggml_tensor * kq_mask,
                             int * sections,
                             int   il);
 
