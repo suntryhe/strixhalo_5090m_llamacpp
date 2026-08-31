@@ -2327,6 +2327,25 @@ struct llama_model_qwen4exp : public llama_model_base {
         // [TAG_QSA_GATHER] gathered decode attention
         int64_t qsa_gather_n_sel(int64_t n_kv, int64_t width) const;
 
+        // [TAG_QSA_HOTBLOCK] prefill hot window: returns the history cell budget it
+        // selects over, or 0 to keep the per-token dense selection
+        int64_t qsa_hot_hist_cells(int64_t n_kv, int64_t n_tps, int64_t n_stream, int64_t r) const;
+
+        // cells the hot window actually attends: clamped history blocks plus the
+        // chunk's own cells
+        int64_t qsa_hot_n_real(int64_t n_kv, int64_t n_tps, int64_t n_stream, int64_t r) const;
+
+        // [TAG_QSA_HOTBLOCK] gathered prefill attention over the shared hot window
+        ggml_tensor * build_attn_qsa_hot(
+                ggml_tensor * k,
+                ggml_tensor * v,
+                ggml_tensor * kq_mask,
+                ggml_tensor * q_cur,
+                ggml_tensor * hot_idx,
+                int64_t       n_real,
+                float         kq_scale,
+                int           il);
+
         ggml_tensor * build_attn_qsa_gather(
                 ggml_tensor * k,
                 ggml_tensor * v,

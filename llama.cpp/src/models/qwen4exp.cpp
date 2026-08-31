@@ -725,9 +725,18 @@ public:
         bool res = true;
 
         res &= k_idxs->ne[0]   == (int64_t) params.ubatch.n_tokens;
-        res &= cell_blk->ne[0] == (int64_t) mctx_new->get_idx()->get_n_kv();
-        res &= cell_blk->ne[1] == (int64_t) mctx_new->get_n_stream();
-        res &= bias->ne[1] * bias->ne[2] == (int64_t) params.ubatch.n_tokens;
+        res &= bias == nullptr || bias->ne[1] * bias->ne[2] == (int64_t) params.ubatch.n_tokens;
+
+        // pin the idx cache extent: cell_blk on the per-token paths, the hot window's
+        // block table otherwise
+        if (cell_blk != nullptr) {
+            res &= cell_blk->ne[0] == (int64_t) mctx_new->get_idx()->get_n_kv();
+            res &= cell_blk->ne[1] == (int64_t) mctx_new->get_n_stream();
+        } else {
+            const int64_t n_blocks = ((int64_t) mctx_new->get_idx()->get_n_kv() + (int64_t) ratio - 1)/ratio;
+            res &= blk_cells != nullptr && blk_cells->ne[0] == (int64_t) ratio*n_blocks;
+            res &= blk_cells->ne[1] == (int64_t) mctx_new->get_n_stream();
+        }
 
         // [TAG_QSA_POOLED_CACHE] the dirty tables must hold this ubatch's (re)pool range;
         // steady decode needs at most one block, so the capacity is stable at 1 there
@@ -776,6 +785,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     GGML_ASSERT(n_tokens % n_stream == 0);
     const int64_t n_tps = n_tokens/n_stream;
 
+    // [TAG_QSA_HOTBLOCK] >0 selects the shared hot window for this chunk; the per-token
+    // bias is then dead and stays out of the graph
+    const int64_t hot_cells = qsa_hot_n_real(n_kv, n_tps, n_stream, r);
+
     // the tables and bias depend only on the cells and the ubatch: every QSA layer in the
     // graph shares one input, so the host fills them once per batch instead of once per layer
     llm_graph_input_qsa * inp = (llm_graph_input_qsa *) qsa_shared;
@@ -783,11 +796,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r);
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-        qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
-        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_kv, n_tps, n_stream);
-
-        ggml_set_input(qsa->cell_blk);
-        ggml_set_input(qsa->bias);
+        // hot window graphs never read cell_blk; an unreferenced input would get no
+        // buffer, so it only exists on the per-token paths
+        if (hot_cells == 0) {
+            qsa->cell_blk = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+            ggml_set_input(qsa->cell_blk);
+        }
+        if (hot_cells == 0) {
+            qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_kv, n_tps, n_stream);
+            ggml_set_input(qsa->bias);
+        }
 
         // [TAG_QSA_POOLED_CACHE] complete blocks' summaries are cached; per ubatch only the
         // freshly completed blocks (plus any pending refill after a full state load) are
@@ -806,6 +824,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_set_input(qsa->dirty_cells);
             ggml_set_input(qsa->dirty_pos);
             ggml_set_input(qsa->dirty_rows);
+
+            // the hot window expands its blocks through the table even on the pooled path
+            if (hot_cells > 0) {
+                qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
+                ggml_set_input(qsa->blk_cells);
+            }
         } else {
             qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
             qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
@@ -931,6 +955,63 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         }
         score = summed;
         cb(score, "indexer_score", il);
+
+        // [TAG_QSA_HOTBLOCK] block-level selection: over completed history blocks the
+        // per-token scores are identical (shared block score, zero bias), so summing the
+        // token scores picks the union the dense per-token top_k would return. The
+        // chunk's own cells ride along unfiltered, causally masked by their KQ mask rows
+        // in build_attn_qsa_hot.
+        if (hot_cells > 0) {
+            const int64_t hist_budget  = qsa_hot_hist_cells(n_kv, n_tps, n_stream, r);
+            const int64_t n_hist_cells  = n_kv - n_tps*n_stream;
+            const int64_t n_hist_blocks = n_hist_cells/r;
+            const int64_t n_hot_blocks  = std::min<int64_t>(hist_budget/r, n_hist_blocks);
+            GGML_ASSERT(n_hot_blocks >= 1);
+
+            ggml_tensor * hist = ggml_view_3d(ctx0, score, n_tps, n_hist_blocks, n_stream,
+                    score->nb[1], score->nb[2], 0);
+            ggml_tensor * blk_score = ggml_sum_rows(ctx0, hist);            // [1, n_hist_blocks, ns]
+            blk_score = ggml_reshape_2d(ctx0,
+                    ggml_cont(ctx0, ggml_permute(ctx0, blk_score, 1, 0, 2, 3)), n_hist_blocks, n_stream);
+
+            ggml_tensor * hot_blk = ggml_top_k(ctx0, blk_score, (int) n_hot_blocks);
+
+            // block b's cells sit at rows [b*r, (b+1)*r) of the shared block table
+            ggml_tensor * rows = ggml_cast(ctx0, hot_blk, GGML_TYPE_F32);
+            rows = ggml_scale(ctx0, rows, (float) r);
+            rows = ggml_repeat_4d(ctx0, rows, n_hot_blocks, r, n_stream, 1);
+            ggml_tensor * slot = ggml_arange(ctx0, 0.0f, (float) r, 1.0f);
+            slot = ggml_reshape_3d(ctx0, slot, 1, r, n_stream);
+            rows = ggml_cast(ctx0, ggml_add(ctx0, rows, slot), GGML_TYPE_I32);
+            rows = ggml_reshape_2d(ctx0, rows, n_hot_blocks*r, n_stream);
+
+            GGML_ASSERT(inp->blk_cells != nullptr);
+            // rows of width one, so the gather returns the cell ids themselves
+            ggml_tensor * hot_sel = ggml_get_rows(ctx0,
+                    ggml_view_2d(ctx0, inp->blk_cells, 1, r*n_blocks,
+                        inp->blk_cells->nb[0], 0), rows);
+            hot_sel = ggml_reshape_2d(ctx0, hot_sel, n_hot_blocks*r, n_stream);
+
+            // this chunk's own cells: slots append in order, one per token
+            ggml_tensor * self_cells = ggml_cast(ctx0,
+                    ggml_arange(ctx0, (float) n_hist_cells, (float) n_kv, 1.0f), GGML_TYPE_I32);
+            self_cells = ggml_reshape_2d(ctx0, self_cells, n_tps, n_stream);
+
+            const int64_t n_raw = n_hot_blocks*r + n_tps;
+            const int64_t n_sel = GGML_PAD(n_raw, 256);
+
+            ggml_tensor * idx = ggml_concat(ctx0, hot_sel, self_cells, 0);
+            if (n_sel > n_raw) {
+                ggml_tensor * last = ggml_view_1d(ctx0, idx, 1, (n_raw - 1)*ggml_element_size(idx));
+                ggml_tensor * pad = ggml_cast(ctx0, ggml_repeat_4d(ctx0,
+                            ggml_cast(ctx0, last, GGML_TYPE_F32), n_sel - n_raw, 1, 1, 1), GGML_TYPE_I32);
+                pad = ggml_reshape_2d(ctx0, pad, n_sel - n_raw, n_stream);
+                idx = ggml_concat(ctx0, idx, pad, 0);
+            }
+
+            // build_attn_qsa takes the shared-window gather when ne[1] == 1
+            return ggml_reshape_4d(ctx0, idx, n_sel, 1, 1, n_stream);
+        }
 
         // give every token of a block the block score; the budget is a whole number of
         // blocks, so the top-k cut still lands on a block boundary
@@ -1067,6 +1148,54 @@ int64_t llama_model_qwen4exp::graph::qsa_gather_n_sel(int64_t n_kv, int64_t widt
     return n_sel;
 }
 
+// [TAG_QSA_HOTBLOCK] tuning: LLAMA_QSA_HOTBLOCK is "0" to disable, an integer for the
+// minimum history cells it activates at (default 8192); LLAMA_QSA_HOTBLOCK_CELLS sets
+// the history budget in cells (default 2048, rounded to whole pooled blocks)
+int64_t llama_model_qwen4exp::graph::qsa_hot_hist_cells(
+        int64_t n_kv, int64_t n_tps, int64_t n_stream, int64_t r) const {
+    static const int64_t min_hist = [] {
+        const char * env = getenv("LLAMA_QSA_HOTBLOCK");
+        if (env == nullptr) {
+            return (int64_t) 8192;
+        }
+        const int64_t v = atoll(env);
+        return v <= 0 ? INT64_MAX : v;
+    }();
+
+    static const int64_t budget = [] {
+        const char * env = getenv("LLAMA_QSA_HOTBLOCK_CELLS");
+        return env == nullptr ? (int64_t) 2048 : atoll(env);
+    }();
+
+    // the gathered visibility rides the f16 KQ mask, exactly like the decode gather
+    if (!cparams.flash_attn || hparams.use_alibi) {
+        return 0;
+    }
+
+    // prefill chunks only (decode rides qsa_gather_n_sel), single stream (one block
+    // table), and a history worth selecting over
+    const int64_t n_hist_cells = n_kv - n_tps*n_stream;
+
+    if (n_tps <= 16 || n_stream != 1 || n_hist_cells < std::max<int64_t>(min_hist, r)) {
+        return 0;
+    }
+
+    return std::max<int64_t>(r, (budget/r)*r);
+}
+
+// attended range of the hot window: clamped history blocks plus the chunk's own cells
+int64_t llama_model_qwen4exp::graph::qsa_hot_n_real(
+        int64_t n_kv, int64_t n_tps, int64_t n_stream, int64_t r) const {
+    const int64_t hist = qsa_hot_hist_cells(n_kv, n_tps, n_stream, r);
+    if (hist == 0) {
+        return 0;
+    }
+
+    const int64_t n_hist_blocks = (n_kv - n_tps*n_stream)/r;
+
+    return std::min<int64_t>(hist/r, n_hist_blocks)*r + n_tps*n_stream;
+}
+
 // [TAG_QSA_GATHER] ported from EngramHalo.cpp.
 // Decode fast path for QSA: instead of unmasking the top-k cells inside a dense [n_kv] attention,
 // gather exactly those K/V rows out of the cache and attend over [n_sel] cells. KV bandwidth and
@@ -1160,6 +1289,114 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_gather(
     return cur;
 }
 
+// [TAG_QSA_HOTBLOCK] Prefill fast path: every token of the chunk attends one shared
+// window (indexer-selected history blocks plus the chunk's own cells), so the attention
+// work per chunk stops growing with n_kv. Visibility is exact: each gathered row keeps
+// its original KQ mask value, and the pad rows are re-masked to -inf.
+ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_hot(
+        ggml_tensor * k,        // [n_embd_head_k, n_head_kv, n_kv, ns] view of the K cache
+        ggml_tensor * v,        // [n_embd_head_v, n_head_kv, n_kv, ns] view of the V cache
+        ggml_tensor * kq_mask,  // F16 [n_kv, n_tps, 1, ns]
+        ggml_tensor * q_cur,    // F32 [n_embd_head_k, n_head, n_tokens]
+        ggml_tensor * hot_idx,  // I32 [n_sel, 1, 1, ns] shared cell selection
+        int64_t       n_real,   // leading entries of hot_idx that carry the selection
+        float         kq_scale,
+        int           il) {
+    const int64_t d_k   = k->ne[0];
+    const int64_t d_v   = v->ne[0];
+    const int64_t hkv   = k->ne[1];
+    const int64_t n_kv  = k->ne[2];
+    const int64_t ns    = k->ne[3];
+
+    const int64_t n_sel = hot_idx->ne[0];
+    const int64_t n_tps = q_cur->ne[2]/ns;
+
+    static const bool hb_dbg = getenv("LLAMA_QSA_HOTBLOCK_DEBUG") != nullptr;
+    if (hb_dbg) {
+        fprintf(stderr, "HOTDBG il=%d n_kv=%d n_tps=%d ns=%d n_real=%d n_sel=%d hot_idx=[%d,%d,%d,%d]\n",
+                il, (int) n_kv, (int) n_tps, (int) ns, (int) n_real, (int) n_sel,
+                (int) hot_idx->ne[0], (int) hot_idx->ne[1], (int) hot_idx->ne[2], (int) hot_idx->ne[3]);
+    }
+
+    GGML_ASSERT(hot_idx->ne[1] == 1 && hot_idx->ne[2] == 1 && hot_idx->ne[3] == ns);
+    GGML_ASSERT(n_real <= n_sel && n_sel <= n_kv);
+    GGML_ASSERT(v->nb[1] <= v->nb[2] && "QSA hot window needs a non-transposed V cache");
+    GGML_ASSERT(kq_mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_is_contiguous(hot_idx));
+    GGML_ASSERT(ggml_is_contiguous(q_cur));
+
+    // one shared selection: every query of the stream reads the same cell list
+    ggml_tensor * idx = ggml_reshape_2d(ctx0, hot_idx, n_sel, ns);
+
+    // a cell is one contiguous row of d*hkv values in the cache, so fold the head dim away
+    ggml_tensor * k_rows = ggml_view_3d(ctx0, k, d_k*hkv, n_kv, ns, k->nb[2], k->nb[3], 0);
+    ggml_tensor * v_rows = ggml_view_3d(ctx0, v, d_v*hkv, n_kv, ns, v->nb[2], v->nb[3], 0);
+
+    ggml_tensor * k_sel = ggml_cast(ctx0, ggml_get_rows(ctx0, k_rows, idx), GGML_TYPE_F16);
+    ggml_tensor * v_sel = ggml_cast(ctx0, ggml_get_rows(ctx0, v_rows, idx), GGML_TYPE_F16);
+    cb(k_sel, "qsa_hot_k_sel", il);
+    cb(v_sel, "qsa_hot_v_sel", il);
+
+    // [d*hkv, n_sel, ns] -> [d, n_sel, hkv, ns], the flash attention batch layout
+    ggml_tensor * k_g = ggml_view_4d(ctx0, k_sel, d_k, n_sel, hkv, ns,
+            ggml_row_size(k_sel->type, d_k*hkv),
+            ggml_row_size(k_sel->type, d_k),
+            ggml_row_size(k_sel->type, d_k*hkv*n_sel), 0);
+    ggml_tensor * v_g = ggml_view_4d(ctx0, v_sel, d_v, n_sel, hkv, ns,
+            ggml_row_size(v_sel->type, d_v*hkv),
+            ggml_row_size(v_sel->type, d_v),
+            ggml_row_size(v_sel->type, d_v*hkv*n_sel), 0);
+
+    // visibility without a gather: history cells predate the chunk, so every query sees
+    // them and their mask rows are all zero; the chunk's own cells sit at slots
+    // [n_kv - n_tps, n_kv) and keep their causal rows from the mask
+    const int64_t n_hist = n_real - n_tps;
+    GGML_ASSERT(n_hist >= 0);
+
+    ggml_tensor * m = nullptr;
+    if (n_hist > 0) {
+        m = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_hist, n_tps, 1, ns);
+        m = ggml_fill(ctx0, m, 0.0f);
+        m = ggml_cast(ctx0, m, GGML_TYPE_F16);
+    }
+
+    ggml_tensor * m_self = ggml_view_4d(ctx0, kq_mask, n_tps, n_tps, 1, ns,
+            kq_mask->nb[0], kq_mask->nb[1], kq_mask->nb[2], (n_kv - n_tps)*kq_mask->nb[0]);
+    m_self = ggml_cont(ctx0, m_self);
+
+    m = m == nullptr ? m_self : ggml_concat(ctx0, m, m_self, 0);
+
+    // the entries past n_real only pad n_sel for the kernel: mask them back out
+    if (n_real < n_sel) {
+        ggml_tensor * m_pad = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_sel - n_real, n_tps, 1, ns);
+        m_pad = ggml_fill(ctx0, m_pad, -INFINITY);
+        m_pad = ggml_cast(ctx0, m_pad, GGML_TYPE_F16);
+        m = ggml_concat(ctx0, m, m_pad, 0);
+    }
+
+    m = ggml_reshape_4d(ctx0, m, n_sel, n_tps, 1, ns);
+    cb(m, "qsa_hot_kq_mask_sel", il);
+
+    // the chunk rides in ne1 against the shared n_sel rows, one batch per stream
+    ggml_tensor * q = ggml_view_4d(ctx0, q_cur, d_k, q_cur->ne[1], n_tps, ns,
+            q_cur->nb[1], q_cur->nb[2], q_cur->nb[2]*n_tps, 0);
+    q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+
+    ggml_tensor * cur = ggml_flash_attn_ext(ctx0, q, k_g, v_g, m, kq_scale,
+            hparams.f_max_alibi_bias,
+            hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+    res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+
+    ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+
+    // [d_v, n_head, n_tps, ns] -> [d_v*n_head, n_tokens], token order unchanged
+    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+
+    ggml_build_forward_expand(gf, cur);
+
+    return cur;
+}
+
 // Dense GQA self-attention restricted to the cells that top_k names.
 // The mask build below copies the MLA sparse path in llm_graph_context::build_attn.
 ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
@@ -1210,6 +1447,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         const int64_t n_kv  = k->ne[2];
         const int64_t r     = hparams.dsv4_compress_ratios[il];
         const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+
+        // [TAG_QSA_HOTBLOCK] prefill fast path: one shared window (build_qsa_top_k
+        // returned it as [n_sel, 1, 1, n_stream]) instead of masking all n_kv cells.
+        // decode also lands on ne[1] == 1 (n_tps = 1), so the chunk size decides
+        if (top_k->ne[1] == 1 && n_tokens/k->ne[3] > 16) {
+            const int64_t n_real = qsa_hot_n_real(n_kv, n_tokens/k->ne[3], k->ne[3], r);
+            GGML_ASSERT(top_k->ne[0] >= n_real);
+
+            ggml_tensor * cur = build_attn_qsa_hot(k, v, kq_mask, q_cur, top_k, n_real, kq_scale, il);
+            cb(cur, "kqv_out", il);
+
+            // the rotation is its own inverse, so undo it on the value side of the output
+            if (inp->self_v_rot) {
+                cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+            }
+
+            return cur;
+        }
 
         // build_qsa_top_k took the same decision, so top_k already has n_sel entries
         const int64_t n_sel = qsa_gather_n_sel(n_kv, width);
@@ -1280,7 +1535,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
-    const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
+    // LLAMA_QSA_DISABLE=1 falls back to plain full attention (numerics ground truth)
+    const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0
+        && getenv("LLAMA_QSA_DISABLE") == nullptr;
     static bool qsa_dbg_done = false;
     if (!qsa_dbg_done && getenv("QSA_DEBUG")) {
         qsa_dbg_done = true;
