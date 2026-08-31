@@ -1866,15 +1866,31 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
     std::array<std::pair<llama_pos, llama_token>, LLAMA_MAX_SEQ> below;
     below.fill({ -1, LLAMA_TOKEN_NULL });
 
+    // the n-gram window only needs cells at pos >= w0: scan just that range. the
+    // below[] fallback (cells before the window, read only when a lookup falls
+    // through on an M-RoPE gap) is deferred to the first lookup that needs it,
+    // so contiguous text never pays a full-cache pass (upstream #27977/28e3792)
+    bool below_done = false;
+    const auto ensure_below = [&]() {
+        if (below_done) {
+            return;
+        }
+        below_done = true;
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            v_cells[s].for_each_token_in(seqs, 0, std::max(w0, (llama_pos) 0),
+                [&](llama_seq_id seq_id, llama_pos pos, llama_token tok) {
+                    if (pos > below[seq_id].first) {
+                        below[seq_id] = { pos, tok };
+                    }
+                });
+        }
+    };
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         // p_max inclusive: an embd token looks up cells at its own (shared) position
-        v_cells[s].for_each_token_in(seqs, 0, p_max + 1,
+        v_cells[s].for_each_token_in(seqs, std::max(w0, (llama_pos) 0), p_max + 1,
             [&](llama_seq_id seq_id, llama_pos pos, llama_token tok) {
-                if (pos >= w0) {
-                    hist[key(seq_id, pos)] = tok;
-                } else if (pos > below[seq_id].first) {
-                    below[seq_id] = { pos, tok };
-                }
+                hist[key(seq_id, pos)] = tok;
             });
     }
 
@@ -1886,6 +1902,7 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
                 return it->second;
             }
         }
+        ensure_below();
         return below[seq_id].second;
     };
 
