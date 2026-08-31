@@ -920,9 +920,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         // feeding the row-wise top-k below is the only one that survives.
         ggml_tensor * score = ggml_mul_mat(ctx0, q_flat, pooled);      // [nh*n_tps, n_blocks, ns]
         score = ggml_relu(ctx0, score);
-        score = ggml_reshape_2d(ctx0, score, n_idx_h, n_tps*n_blocks*n_stream);
-        score = ggml_sum_rows(ctx0, score);
-        score = ggml_reshape_3d(ctx0, score, n_tps, n_blocks, n_stream);
+        // heads are the fastest axis here: reshape to [h, t, b, s] and sum strided
+        // slices - same shape as the pooling loop above (upstream #27977/618450d)
+        score = ggml_reshape_4d(ctx0, score, n_idx_h, n_tps, n_blocks, n_stream);
+        ggml_tensor * summed = nullptr;
+        for (int64_t h = 0; h < n_idx_h; ++h) {
+            ggml_tensor * slice = ggml_view_3d(ctx0, score, n_tps, n_blocks, n_stream,
+                    score->nb[1], score->nb[2], h*score->nb[0]);
+            summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+        }
+        score = summed;
         cb(score, "indexer_score", il);
 
         // give every token of a block the block score; the budget is a whole number of
@@ -937,9 +944,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_tensor * score = ggml_mul_mat(ctx0, pooled, q_flat);
         score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
         score = ggml_relu(ctx0, score);
-        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
-        score = ggml_sum_rows(ctx0, score);
-        score = ggml_reshape_3d(ctx0, score, n_blocks, n_tps, n_stream);
+        // the heads sit side by side on ne[1] and there are few of them, so summing
+        // slices beats a transpose carrying the whole block-by-token surface twice
+        // (upstream #27977/618450d)
+        ggml_tensor * summed = nullptr;
+        for (int64_t h = 0; h < n_idx_h; ++h) {
+            ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
+                    score->nb[2], score->nb[3], h*score->nb[1]);
+            summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+        }
+        score = summed;
         cb(score, "indexer_score", il);
 
         expanded = ggml_get_rows(ctx0,
