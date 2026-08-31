@@ -15,7 +15,7 @@
 
 FROM localhost/llamacpp:moe-hotstats-prof AS builder
 WORKDIR /src
-COPY . /src
+COPY llama.cpp /src
 RUN cmake -S /src -B /build \
       -DCMAKE_BUILD_TYPE=Release \
       -DBUILD_SHARED_LIBS=ON \

@@ -44,7 +44,7 @@ ENV ROCM_PATH=/opt/rocm \
     LD_LIBRARY_PATH=/opt/rocm/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 
 WORKDIR /src
-COPY . /src
+COPY llama.cpp/ /src/
 
 # same flags as the verified production builds: both backends as runtime-loaded
 # dynamic libraries (GGML_BACKEND_DL), CPU baseline x86-64-v3

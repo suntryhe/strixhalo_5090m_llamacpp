@@ -4,7 +4,9 @@
 
 AMD Strix Halo（Ryzen AI Max 395，gfx1151）+ NVIDIA RTX 5090 单机双卡推理分支：一个 `llama-server` 进程、两个后端（CUDA 跑 attention，ROCm 跑 MoE 专家），面向 `qwen4exp` 混合架构模型（Qwen3.8-Flash-Next）与 lightning-indexer QSA 稀疏注意力。
 
-基于上游 llama.cpp `main`（2026-08 末，#27886 之后），全部改动为增量式或带环境变量开关。上游 llama.cpp 的完整文档（英文）见 [README 英文版](README.md#llamacpp)。
+基于上游 llama.cpp `main`（2026-08 末，#27886 之后），全部改动为增量式或带环境变量开关。上游 llama.cpp 的完整文档（英文）见 [llama.cpp/README.md](llama.cpp/README.md)。
+
+**仓库结构**：补丁后的 llama.cpp 树在 [`llama.cpp/`](llama.cpp/) 子目录；根目录只放本分支自有资产——`configs/` 配置、`docs/` 设计文档、`scripts/` 工具、`Dockerfile.dual` 自包含双后端构建、`Containerfile.qwen-prod` 可复现镜像构建。
 
 ## 与主线差异（22 个提交）
 
@@ -101,6 +103,7 @@ podman build -f Dockerfile.dual -t localhost/llamacpp:dual .
 # 或走本地已验证的工具链基镜像
 podman build -f Containerfile.qwen-prod -t localhost/llamacpp:qwen-prod-v6 .
 # 原生 cmake
+cd llama.cpp
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_BACKEND_DL=ON \
       -DGGML_CUDA=ON -DGGML_HIP=ON -DGGML_NATIVE=OFF -DGGML_CPU=x86-64-v3 \
       -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_HIP_ARCHITECTURES=gfx1151
@@ -109,4 +112,4 @@ cmake --build build --target llama-server -j16
 
 ## 许可
 
-本分支遵循上游 [llama.cpp 的 MIT 许可证](LICENSE)。
+本分支遵循上游 [llama.cpp 的 MIT 许可证](llama.cpp/LICENSE)。
