@@ -1,13 +1,14 @@
 # Containerfile.qwen-prod — qwen4exp QSA 里程碑可复现构建
 # 内容: pooled QSA cache + 共享 QSA input + 窗口化 n-gram 扫描 + indexer head-sum
-# 对应源码: llamacpp-latest @ 678c6b5 (tag decode-qsa-milestone 之后)
+#       + hot-block gather prefill (LLAMA_QSA_HOTBLOCK, 默认开)
+# 对应源码: llamacpp-latest @ 8e5a78e (tag prefill-hotblock-milestone)
 #
 # 构建:  cd ~/opencode/llamacpp-latest
-#        podman build -f Containerfile.qwen-prod -t localhost/llamacpp:qwen-prod-v5 .
+#        podman build -f Containerfile.qwen-prod -t localhost/llamacpp:qwen-prod-v6 .
 # 测试(APU):  podman run --rm -p 5234:5234 --security-opt label=disable \
 #               --device /dev/kfd --device /dev/dri/card0 --device /dev/dri/card1 \
 #               --device /dev/dri/renderD128 --device /dev/dri/renderD129 \
-#               -v /opt/models:/models localhost/llamacpp:qwen-prod-v5 \
+#               -v /opt/models:/models localhost/llamacpp:qwen-prod-v6 \
 #               llama-server -m /models/Qwen3.8-next/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf \
 #               -dev ROCm0 -ngl 999 -c 65536 -fa on -b 2048 -ub 2048 --host 0.0.0.0 --port 5234 \
 #               --parallel 1 --jinja -ctv q8_0 -ctk q8_0
