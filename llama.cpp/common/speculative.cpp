@@ -1397,6 +1397,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // [TAG_MTP_TIMING] env-gated cycle breakdown (LLAMA_SPEC_TIMING=1)
+    bool   timing       = false;
+    double t_catchup_ms = 0;
+    double t_draft_ms   = 0;
+    int64_t n_catchup   = 0;
+    int64_t n_draft_dec = 0;
+    int64_t n_cycles    = 0;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1466,6 +1474,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
         this->n_max = this->params.n_max;
+
+        timing = getenv("LLAMA_SPEC_TIMING") != nullptr;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
@@ -1555,6 +1565,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const int32_t n_b = std::max(1, (int32_t) llama_n_batch(ctx_dft));
 
             bool ok = true;
+            const int64_t t0_catch = timing ? ggml_time_us() : 0;
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (i_batch_beg[seq_id] < 0) {
                     continue;
@@ -1607,6 +1618,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
             }
 
+            if (timing) {
+                t_catchup_ms += (ggml_time_us() - t0_catch) / 1000.0;
+                n_catchup++;
+            }
+
             if (chain_heads) {
                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
             }
@@ -1637,6 +1653,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        const int64_t t0_draft = timing ? ggml_time_us() : 0;
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
@@ -1769,6 +1786,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             ++i;
+        }
+
+        if (timing) {
+            t_draft_ms += (ggml_time_us() - t0_draft) / 1000.0;
+            n_draft_dec += n_drafting;
+            if (++n_cycles % 16 == 0) {
+                SPC_WRN("TIMING last16: draft=%.1fms (calls=%lld) catchup=%.1fms (calls=%lld) | avg/cycle draft=%.1fms catchup=%.1fms\n",
+                        t_draft_ms, (long long) n_draft_dec, t_catchup_ms, (long long) n_catchup,
+                        t_draft_ms / 16, t_catchup_ms / 16);
+                t_draft_ms = 0;
+                t_catchup_ms = 0;
+                n_catchup = 0;
+                n_draft_dec = 0;
+            }
         }
 
         if (chain_heads) {
