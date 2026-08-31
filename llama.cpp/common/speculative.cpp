@@ -1551,55 +1551,58 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
-            common_batch_clear(batch);
+            auto * mem_dft = llama_get_memory(ctx_dft);
+            const int32_t n_b = std::max(1, (int32_t) llama_n_batch(ctx_dft));
 
-            for (int k = 0; k < n_tokens; ++k) {
-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
-            }
-
-            // shift the tgt embeddings to the right by one position
-            // assumes that the tokens in the batch are sequential for each sequence
-            // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
-            //                                                       ^--- this is a problem
-            // TODO:this is generally true, but would be nice to assert it
-            {
-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
-            }
-
-            // fill the pending embeddings from a previous run
-            auto set_h = [&](int idx, const float * h_row) {
-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
-            };
-
+            bool ok = true;
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (i_batch_beg[seq_id] < 0) {
                     continue;
                 }
 
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
-            }
+                // the target ubatch can exceed the draft batch capacity; run the
+                // catch-up decode in n_b-sized chunks. the head input is the target
+                // embedding shifted right by one: row 0 carries the pending row from
+                // the previous batch (or chunk), row j>0 takes h_tgt row (c0+j-1).
+                const int32_t b0 = i_batch_beg[seq_id];
+                const int32_t n_rows = i_batch_end[seq_id] - b0 + 1;
+                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+                const float * h_carry = pending_h[seq_id].data();
 
-            auto * mem_dft = llama_get_memory(ctx_dft);
+                for (int32_t c0 = 0; c0 < n_rows && ok; c0 += n_b) {
+                    const int32_t nc = std::min(n_b, n_rows - c0);
+                    common_batch_clear(batch);
 
-            bool ok = true;
-            for (int head = 0; head < n_mtp_layers; ++head) {
-                if (chain_heads) {
-                    // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
-                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                        if (i_batch_beg[seq_id] < 0) {
-                            continue;
-                        }
-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
+                    for (int32_t j = 0; j < nc; ++j) {
+                        const int32_t k = b0 + c0 + j;
+                        common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { seq_id }, 0);
                     }
-                    llama_set_nextn_layer_offset(ctx_dft, head);
+
+                    std::memcpy(batch.embd, h_carry, row_bytes);
+                    if (nc > 1) {
+                        std::memcpy(batch.embd + n_embd, h_tgt + (size_t)(b0 + c0) * n_embd,
+                                (size_t)(nc - 1) * row_bytes);
+                    }
+
+                    for (int head = 0; head < n_mtp_layers; ++head) {
+                        if (chain_heads) {
+                            // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
+                            llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[b0 + c0], -1);
+                            llama_set_nextn_layer_offset(ctx_dft, head);
+                        }
+
+                        const int32_t rc = llama_decode(ctx_dft, batch);
+                        if (rc != 0) {
+                            SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                                    head, (int) rc, (int) batch_in.pos[b0 + c0]);
+                            ok = false;
+                            break;
+                        }
+                    }
+                    h_carry = h_tgt + (size_t)(b0 + c0 + nc - 1) * n_embd;
                 }
 
-                const int32_t rc = llama_decode(ctx_dft, batch);
-                if (rc != 0) {
-                    SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.pos[0]);
-                    ok = false;
+                if (!ok) {
                     break;
                 }
             }
