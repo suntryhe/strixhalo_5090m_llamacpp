@@ -989,6 +989,40 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     top_k = ggml_reshape_4d(ctx0, top_k, n_sel, n_tps, 1, n_stream);
     cb(top_k, "indexer_top_k", il);
 
+    // QSA selection-concentration diagnostics: dump the prefill selections of the
+    // first chunks into a persistent buffer, then analyze one deep chunk on host
+    { static int cpy_n = 0; static bool ana_done = false;
+      ggml_tensor * dump = mctx_hyb->get_dump_topk();
+      if (dump != nullptr && n_tps > 8) {
+          if (!ana_done && n_kv >= 40000 && cpy_n >= 12) {
+              std::vector<int32_t> host((size_t)(dump->ne[0]*dump->ne[1]), 0);
+              ggml_backend_tensor_get(dump, host.data(), 0, ggml_nbytes(dump));
+              const int64_t n_total = dump->ne[0]*dump->ne[1];
+              int64_t uniq = 0;
+              std::vector<uint8_t> seen(n_kv, 0);
+              for (int64_t i = 0; i < n_total; ++i) {
+                  const int64_t c = host[i];
+                  if (c >= 0 && c < n_kv && !seen[c]) { seen[c] = 1; ++uniq; }
+              }
+              int64_t blocks_touched = 0;
+              for (int64_t b0 = 0; b0 < n_kv; b0 += 256) {
+                  for (int64_t c = b0; c < b0+256 && c < n_kv; ++c) {
+                      if (seen[c]) { ++blocks_touched; break; }
+                  }
+              }
+              const int64_t nb_total = (n_kv + 255)/256;
+              fprintf(stderr, "SELDBG n_kv=%d uniq=%lld/%d (%.1f%%) blocks=%lld/%d (%.1f%%)\n",
+                      (int) n_kv, (long long) uniq, (int) n_kv, 100.0*uniq/n_kv,
+                      (long long) blocks_touched, (int) nb_total, 100.0*blocks_touched/nb_total);
+              ana_done = true;
+          }
+          if (!ana_done && cpy_n < 120 && ggml_nelements(top_k) == ggml_nelements(dump)) {
+              ggml_build_forward_expand(gf, ggml_cpy(ctx0, top_k, dump));
+              ++cpy_n;
+          }
+      }
+    }
+
     return top_k;
 }
 

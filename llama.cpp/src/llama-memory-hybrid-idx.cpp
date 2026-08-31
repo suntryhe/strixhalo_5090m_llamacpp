@@ -109,6 +109,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                 pooled_k[(int32_t) il] = t;
             }
 
+            ggml_tensor * dt = ggml_new_tensor_2d(pooled_ctx.get(), GGML_TYPE_I32, 2048, 2048);
+            ggml_format_name(dt, "qsa_sel_dump");
+            dump_topk = dt;
             if (!pooled_k.empty()) {
                 pooled_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pooled_ctx.get(), buft));
                 GGML_ASSERT(pooled_buf && "failed to allocate the pooled indexer key cache");
@@ -126,6 +129,10 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 ggml_tensor * llama_memory_hybrid_idx::get_pooled_k(int32_t il) const {
     const auto it = pooled_k.find(il);
     return it == pooled_k.end() ? nullptr : it->second;
+}
+
+ggml_tensor * llama_memory_hybrid_idx::get_dump_topk() const {
+    return dump_topk;
 }
 
 int64_t & llama_memory_hybrid_idx::pooled_valid(llama_seq_id seq_id) const {
@@ -710,6 +717,10 @@ uint32_t llama_memory_hybrid_idx_context::get_ple_hist_keep() const {
 
 ggml_tensor * llama_memory_hybrid_idx_context::get_pooled_k(int32_t il) const {
     return mem != nullptr && get_idx() != nullptr ? mem->get_pooled_k(il) : nullptr;
+}
+
+ggml_tensor * llama_memory_hybrid_idx_context::get_dump_topk() const {
+    return mem != nullptr && get_idx() != nullptr ? mem->get_dump_topk() : nullptr;
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_pooled_rows() const {

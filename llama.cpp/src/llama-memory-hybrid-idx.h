@@ -112,6 +112,7 @@ public:
     // masked by the -inf bias exactly like today's partial-block pools.
 
     // pooled key tensor for layer il, or nullptr (no indexer / multi-stream / disabled)
+    ggml_tensor * get_dump_topk() const;
     ggml_tensor * get_pooled_k(int32_t il) const;
 
     uint32_t get_pooled_rows() const { return pooled_rows; }   // rows per stream, incl. trailing dustbin row
@@ -143,6 +144,7 @@ private:
     ggml_context_ptr        pooled_ctx;
     ggml_backend_buffer_ptr pooled_buf;
     std::map<int32_t, ggml_tensor *> pooled_k;
+    ggml_tensor * dump_topk = nullptr;
 
     uint32_t pooled_rows  = 0;
     uint32_t pooled_ratio = 0;
@@ -220,6 +222,7 @@ public:
 
     // [TAG_QSA_POOLED_CACHE] pooled tensor for il, or nullptr when the cache is unavailable
     // (no indexer, multi-stream memory, or a non-batch context)
+    ggml_tensor * get_dump_topk() const;
     ggml_tensor * get_pooled_k(int32_t il) const;
 
     uint32_t get_pooled_rows() const;
