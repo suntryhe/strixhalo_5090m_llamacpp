@@ -1,0 +1,68 @@
+# Dockerfile.dual - self-contained dual-backend build (CUDA sm_120 + ROCm gfx1151)
+# One image that compiles llama-server with both backends for the
+# Strix Halo (Ryzen AI Max 395, gfx1151) + RTX 5090 split-inference setup.
+#
+# Build:
+#   podman build -f Dockerfile.dual -t localhost/llamacpp:dual .
+# Run (dual-card; mount /nvidia-libs with the host NVIDIA userland when present):
+#   podman run --rm -p 5234:5234 --security-opt label=disable \
+#     --device /dev/kfd --device /dev/dri --device /dev/nvidia0 \
+#     --device /dev/nvidiactl --device /dev/nvidia-uvm --device /dev/nvidia-uvm-tools \
+#     -v /opt/models:/models -v /usr/lib/x86_64-linux-gnu/nvidia:/nvidia-libs:ro \
+#     localhost/llamacpp:dual \
+#     llama-server -m /models/<model>.gguf -dev CUDA0,ROCm0 -ngl 999 -ts 1,0 -fa on \
+#       -c 65536 -b 2048 -ub 2048 --host 0.0.0.0 --port 5234 -ctv q8_0 -ctk q8_0
+#
+# NOTE: toolchain install pulls ~15GB. The proven local alternative is
+# Containerfile.qwen-prod (builds inside an existing ROCm+CUDA toolchain base).
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# CUDA 12.8 repo (sm_120 needs >= 12.8)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg build-essential cmake ninja-build git ccache \
+        python3 python3-pip libcurl4-openssl-dev libgomp1 \
+    && curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb -o /tmp/cuda-keyring.deb \
+    && dpkg -i /tmp/cuda-keyring.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends cuda-toolkit-12-8 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ROCm 6.4 repo (gfx1151 needs >= 6.4 for rdna3.5)
+RUN curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor -o /etc/apt/trusted.gpg.d/rocm.gpg \
+    && echo "deb [arch=amd64] https://repo.radeon.com/rocm/apt/6.4 noble main" > /etc/apt/sources.list.d/rocm.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        rocm-hip-runtime rocm-hip-sdk rocm-libraries rocm-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV ROCM_PATH=/opt/rocm \
+    HIP_PATH=/opt/rocm \
+    PATH=/opt/rocm/bin:/usr/local/cuda/bin:${PATH} \
+    LD_LIBRARY_PATH=/opt/rocm/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+
+WORKDIR /src
+COPY . /src
+
+# same flags as the verified production builds: both backends as runtime-loaded
+# dynamic libraries (GGML_BACKEND_DL), CPU baseline x86-64-v3
+RUN git submodule update --init --recursive \
+    && cmake -S /src -B /build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=ON \
+        -DGGML_BACKEND_DL=ON \
+        -DGGML_CUDA=ON \
+        -DGGML_HIP=ON \
+        -DGGML_NATIVE=OFF \
+        -DGGML_CPU=x86-64-v3 \
+        -DCMAKE_CUDA_ARCHITECTURES=120 \
+        -DCMAKE_HIP_ARCHITECTURES=gfx1151 \
+        -DCMAKE_PREFIX_PATH=/opt/rocm \
+        -G Ninja \
+    && cmake --build /build --target llama-server llama-perplexity llama-cli -j"$(nproc)"
+
+ENV LD_LIBRARY_PATH=/build/bin:/nvidia-libs
+WORKDIR /app
+ENTRYPOINT ["/build/bin/llama-server"]

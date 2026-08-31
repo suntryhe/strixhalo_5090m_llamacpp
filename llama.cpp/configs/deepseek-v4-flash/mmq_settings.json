@@ -1,0 +1,5 @@
+{
+  "max_j_occ2": 64,
+  "ubatch": 2047,
+  "ids_helper_smem": "full"
+}
