@@ -1723,11 +1723,25 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
+    // [TAG_MMQ_FORCE_J] tuning override: force a specific J tile (e.g. for
+    // multi-token MoE decode where ntiles_x == 1 for every J and the search
+    // below would always pick the smallest valid J).
+    const char * env_force_j = getenv("GGML_MMQ_FORCE_J");
+    if (env_force_j != nullptr) {
+        const int fj = atoi(env_force_j);
+        if (fj >= 8 && fj <= 128 && fj % 8 == 0) {
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, fj, fallback, cc);
+            if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= (int) smpbo) {
+                J_best = fj;
+            }
+        }
+    }
+
     // Prefer a config that actually achieves occupancy >= 2 (2 blocks/SM co-resident).
     // On RDNA3_5 (gfx1151) with 64KB smpbo, J=128 (36KB) only reaches occ1 while J=96 (31.4KB)
     // reaches occ2. Doubling co-resident blocks doubles in-flight DRAM requests, directly
     // attacking the latency-bound MMQ bottleneck without sacrificing WMMA efficiency (I kept at 64).
-    for (int J = 8; J <= max_j_occ2 && ntiles_J_best > 1; J += 8) {
+    for (int J = 8; J_best == 0 && J <= max_j_occ2 && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
         if (config.type == GGML_TYPE_COUNT) {
             continue;
@@ -1753,7 +1767,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     // Fallback: if no occupancy-2 config is available (e.g. other GPUs with small smpbo),
     // keep the original largest-J behaviour.
     if (J_best == 0) {
-        for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+        for (int J = 8; J_best == 0 && J <= 128 && ntiles_J_best > 1; J += 8) {
             const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
             if (config.type == GGML_TYPE_COUNT) {
                 continue;

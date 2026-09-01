@@ -2040,7 +2040,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
-                if (ne2 <= mmvq_mmid_max) {
+                // ne2 > 1: the GEMV path re-reads every expert weight per token.
+                // GGML_MMQ_MOE_FORCE_MMQ=1 routes multi-token MoE to MMQ instead
+                // (weights stream once) - measured a wash at M<=5 on gfx1151 and
+                // worse by default, so it stays opt-in.
+                static const bool moe_force_mmq = getenv("GGML_MMQ_MOE_FORCE_MMQ") != nullptr;
+                if ((moe_force_mmq || ne2 <= 1) && ne2 <= mmvq_mmid_max) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
